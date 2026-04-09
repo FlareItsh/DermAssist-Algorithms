@@ -1,0 +1,39 @@
+# ============================================================
+# DermAssist - Git Ignore
+# ============================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- Virtual Environment ---
+venv/
+env/
+.venv/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Data & Models (large files) ---
+data/raw/*
+data/processed/*
+models/checkpoints/*
+models/production/*.pth
+!**/.gitkeep
+
+# --- Training Artifacts ---
+training_history.png
+*.log
+
+# --- OS ---
+.DS_Store
+Thumbs.db

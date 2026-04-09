@@ -1,0 +1,58 @@
+# ============================================================
+# DermAssist - Skin Lesion Detection Configuration
+# ============================================================
+# Hyperparameters and settings for training and inference.
+
+# --- Data Settings ---
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  image_size: 224
+  # ImageNet normalization statistics
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  # Ratio of training data vs validation data
+  train_split: 0.8
+  # Number of parallel data-loading workers
+  num_workers: 4
+
+# --- Model Settings ---
+model:
+  backbone: "resnet50"
+  pretrained: true
+  # Number of output classes (update based on your dataset)
+  num_classes: 3
+  # Class labels (DermAssist target diseases)
+  class_names:
+    - "Acne"
+    - "Eczema"
+    - "Herpes Simplex"
+  dropout_rate: 0.5
+
+# --- Training Settings ---
+training:
+  batch_size: 32
+  epochs: 25
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  # Learning rate scheduler step size (epochs)
+  lr_step_size: 7
+  lr_gamma: 0.1
+  # Early stopping patience (epochs without improvement)
+  early_stopping_patience: 5
+  # Path to save model checkpoints during training
+  checkpoint_dir: "models/checkpoints"
+  # Path to save the best production-ready model
+  production_model_path: "models/production/best_model.pth"
+
+# --- Inference Settings ---
+inference:
+  model_path: "models/production/best_model.pth"
+  device: "auto"  # "auto", "cuda", or "cpu"
+  confidence_threshold: 0.5
+
+# --- API Settings ---
+api:
+  host: "0.0.0.0"
+  port: 8000
+  max_file_size_mb: 10
