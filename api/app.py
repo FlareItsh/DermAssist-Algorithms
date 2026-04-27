@@ -1,24 +1,13 @@
 """
-DermAssist - FastAPI Application
-==================================
-REST API for skin lesion classification.
-
-Endpoints:
-    POST /predict  — Upload an image and receive classification results.
-    GET  /health   — Health check endpoint.
-    GET  /classes  — List supported skin lesion classes.
-
-Usage:
-    uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
+!!! SYSTEM FLARE: API/APP.PY IS STARTING NOW !!!
+================================================
 """
-
 import os
 import sys
-import io
-from typing import Dict, List
-
 import yaml
-from PIL import Image
+import torch
+import uvicorn
+from typing import List, Optional, Union
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -26,239 +15,152 @@ from pydantic import BaseModel
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.inference import load_predictor
-
+# Import local modules
+from src.data_loader import load_config
+from src.inference import SkinLesionPredictor
 
 # ============================================================
-# Response Models
+# Schemas
 # ============================================================
+
+class Prediction(BaseModel):
+    label: str
+    confidence: float
 
 class PredictionResponse(BaseModel):
-    """Response schema for the /predict endpoint."""
     label: str
     confidence: float
-    class_index: int
-    all_probabilities: Dict[str, float]
-
-
-class TopKPrediction(BaseModel):
-    """Single prediction entry."""
-    label: str
-    confidence: float
-
-
-class TopKResponse(BaseModel):
-    """Response schema for top-K predictions."""
-    predictions: List[TopKPrediction]
-
+    all_probabilities: dict
+    device: str
+    architecture: str
 
 class HealthResponse(BaseModel):
-    """Response schema for the /health endpoint."""
     status: str
     model_loaded: bool
     device: str
 
-
 class ClassesResponse(BaseModel):
-    """Response schema for the /classes endpoint."""
     classes: List[str]
     num_classes: int
 
+
+# ---- Global Model Loading (Eager) ----
+print("\n" + "="*60)
+print(" 🚀 DERMASSIST AI: EAGER LOADING STARTING...")
+print("="*60)
+
+def init_predictor_sync():
+    """Synchronously load the model at top-level."""
+    print(f"[DEBUG] Current Directory: {os.getcwd()}")
+    try:
+        # Load settings from config
+        config_path = "config.yaml"
+        if not os.path.exists(config_path):
+            print(f"[API] ❌ ERROR: Cannot find {config_path}")
+            return None
+            
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+            
+        active_arch = config["inference"].get("active_inference_model", "resnet50")
+        
+        # FORCE LEGACY LOCK for stability during training
+        model_path = os.path.join("models/production", "best_3class_legacy.pth")
+        active_arch = "resnet50"
+        
+        if not os.path.exists(model_path):
+            print(f"[API] ❌ ERROR: Legacy model {model_path} missing!")
+            return None
+
+        print(f"[API] ⏳ LOADING MODEL: {active_arch.upper()} from {model_path}")
+        
+        predictor = SkinLesionPredictor(
+            model_path=model_path,
+            config=config,
+            device="cpu", 
+            architecture=active_arch
+        )
+        
+        print(f"============================================================")
+        print(f" 🎉 SUCCESS: AI BRAIN READY!")
+        print(f"============================================================\n")
+        return predictor
+        
+    except Exception as e:
+        import traceback
+        print(f"\n[API] ❌ CRITICAL EAGER LOAD FAILURE:")
+        print(traceback.format_exc())
+        return None
+
+# Load it NOW
+predictor = init_predictor_sync()
 
 # ============================================================
 # Application Setup
 # ============================================================
 
 app = FastAPI(
-    title="DermAssist — Skin Lesion Detection API",
-    description=(
-        "Upload a dermoscopic image and receive an AI-powered "
-        "skin lesion classification with confidence scores."
-    ),
+    title="DermAssist AI API",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
 )
 
-# CORS — allow requests from the DermAssist frontend
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Tighten in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- Global predictor (loaded once at startup) ----
-predictor = None
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Load the ML model once when the server starts."""
-    global predictor
-    try:
-        config_path = os.environ.get("DERMASSIST_CONFIG", "config.yaml")
-        model_path = os.environ.get("DERMASSIST_MODEL", None)
-        predictor = load_predictor(
-            config_path=config_path,
-            model_path=model_path,
-        )
-        print("[API] ✅ Model loaded successfully")
-    except FileNotFoundError as e:
-        print(f"[API] ⚠ Model file not found: {e}")
-        print("[API] The /predict endpoint will return 503 until a model is available.")
-    except Exception as e:
-        print(f"[API] ⚠ Failed to load model: {e}")
-        print("[API] The /predict endpoint will return 503 until a model is available.")
-
-
-# ============================================================
-# Endpoints
-# ============================================================
-
-@app.get("/health", response_model=HealthResponse, tags=["System"])
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Check API health and model status."""
     return HealthResponse(
         status="healthy",
         model_loaded=predictor is not None,
         device=str(predictor.device) if predictor else "N/A",
     )
 
-
-@app.get("/classes", response_model=ClassesResponse, tags=["System"])
+@app.get("/classes", response_model=ClassesResponse)
 async def get_classes():
-    """List all supported skin lesion classes."""
     if predictor is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded. Please check server logs.",
-        )
+        raise HTTPException(status_code=503, detail="Model not loaded")
     return ClassesResponse(
         classes=predictor.class_names,
         num_classes=len(predictor.class_names),
     )
 
-
-@app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
+@app.post("/predict", response_model=PredictionResponse)
 async def predict(file: UploadFile = File(...)):
-    """
-    Classify a skin lesion image.
-
-    Accepts a multipart image file (JPEG, PNG, BMP, TIFF).
-    Returns the predicted label and confidence score.
-
-    **Example response:**
-    ```json
-    {
-        "label": "Melanoma",
-        "confidence": 0.9234,
-        "class_index": 4,
-        "all_probabilities": {
-            "Actinic keratoses": 0.0021,
-            "Basal cell carcinoma": 0.0103,
-            ...
-        }
-    }
-    ```
-    """
-    # Validate model is loaded
     if predictor is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded. Train a model first and place "
-                   "the .pth file in models/production/.",
-        )
-
-    # Validate file type
-    allowed_types = {
-        "image/jpeg", "image/png", "image/bmp",
-        "image/tiff", "image/webp",
-    }
-    if file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type: {file.content_type}. "
-                   f"Allowed: {', '.join(allowed_types)}",
-        )
-
+        raise HTTPException(status_code=503, detail="AI Brain is not loaded.")
+        
     try:
-        # Read and validate image
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-
-        # Run inference
-        result = predictor.predict(image)
-
+        # Save temp file
+        temp_path = f"temp_{file.filename}"
+        with open(temp_path, "wb") as buffer:
+            buffer.write(await file.read())
+            
+        # Inference
+        result = predictor.predict(temp_path)
+        
+        # Cleanup
+        os.remove(temp_path)
+        
         return PredictionResponse(
             label=result["label"],
             confidence=result["confidence"],
-            class_index=result["class_index"],
             all_probabilities=result["all_probabilities"],
+            device=str(predictor.device),
+            architecture=predictor.architecture
         )
-
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Prediction failed: {str(e)}",
-        )
-
-
-@app.post("/predict/top-k", response_model=TopKResponse, tags=["Prediction"])
-async def predict_top_k(file: UploadFile = File(...), k: int = 3):
-    """
-    Get top-K predictions for a skin lesion image.
-
-    Args:
-        file: Multipart image file.
-        k:    Number of top predictions to return (default: 3).
-    """
-    if predictor is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded.",
-        )
-
-    try:
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-
-        results = predictor.predict_top_k(image, k=k)
-
-        return TopKResponse(
-            predictions=[
-                TopKPrediction(label=r["label"], confidence=r["confidence"])
-                for r in results
-            ]
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Prediction failed: {str(e)}",
-        )
-
-
-# ============================================================
-# Run directly with: python api/app.py
-# ============================================================
+        import traceback
+        print("\n" + "!"*60)
+        print(" ❌ PREDICTION CRASH:")
+        print(traceback.format_exc())
+        print("!"*60 + "\n")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    import uvicorn
-
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
-
-    host = config["api"]["host"]
-    port = config["api"]["port"]
-
-    print(f"\n🚀 Starting DermAssist API on http://{host}:{port}")
-    print(f"📖 Interactive docs at http://{host}:{port}/docs\n")
-
-    uvicorn.run(
-        "api.app:app",
-        host=host,
-        port=port,
-        reload=True,
-    )
+    uvicorn.run("api.app:app", host="0.0.0.0", port=8000, reload=True)

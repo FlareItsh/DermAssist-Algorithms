@@ -13,11 +13,13 @@ python-multipart>=0.0.6
 
 # --- Image Processing ---
 Pillow>=10.0.0
+opencv-python>=4.8.0
 
 # --- Configuration ---
 PyYAML>=6.0
 
 # --- Utilities ---
+kagglehub>=0.2.0
 tqdm>=4.65.0
 numpy>=1.24.0
 scikit-learn>=1.3.0

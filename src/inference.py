@@ -16,7 +16,7 @@ Usage:
 import os
 import sys
 import argparse
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Union
 
 import yaml
 import torch
@@ -45,6 +45,7 @@ class SkinLesionPredictor:
         model_path: str,
         config: dict,
         device: Optional[str] = None,
+        architecture: str = "resnet50",
     ):
         """
         Args:
@@ -74,13 +75,33 @@ class SkinLesionPredictor:
         num_classes = len(self.class_names)
 
         # ---- Build model and load weights ----
+        # Priority: Checkpoint > Manual Override (architecture param) > Config
+        arch = architecture
+        if "architecture" in checkpoint:
+            arch = checkpoint["architecture"]
+        
+        self.architecture = arch
+
         self.model = SkinLesionClassifier(
             num_classes=num_classes,
-            pretrained=False,  # We're loading weights manually
+            pretrained=False,
             dropout_rate=config["model"].get("dropout_rate", 0.5),
+            architecture=arch
         )
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.model = self.model.to(self.device)
+        # ---- Deep Weight Mapping (Legacy Fix) ----
+        state_dict = checkpoint["model_state_dict"]
+        new_state_dict = {}
+        
+        # If the model has 'classifier' but checkpoint has 'backbone.fc', we bridge them
+        for key, value in state_dict.items():
+            if key.startswith("backbone.fc."):
+                new_key = key.replace("backbone.fc.", "classifier.")
+                new_state_dict[new_key] = value
+            new_state_dict[key] = value
+            
+        missing, unexpected = self.model.load_state_dict(new_state_dict, strict=False)
+        
+        self.model.to(self.device)
         self.model.eval()
 
         # ---- Build transform pipeline ----
@@ -93,20 +114,20 @@ class SkinLesionPredictor:
     # Predict a single image
     # ---------------------------------------------------------
     @torch.no_grad()
-    def predict(self, image: Image.Image) -> Dict[str, object]:
+    def predict(self, image: Union[Image.Image, str]) -> dict:
         """
-        Run inference on a single PIL Image.
+        Run inference on a single PIL Image or a path to an image.
 
         Args:
-            image: PIL Image (any size, will be resized).
+            image: PIL Image or string path.
 
         Returns:
-            Dictionary with:
-                - 'label':       Predicted class name
-                - 'confidence':  Prediction confidence (0.0 - 1.0)
-                - 'class_index': Predicted class index
-                - 'all_probabilities': Dict mapping class name → probability
+            Dictionary with prediction results.
         """
+        # If a path was provided, open it
+        if isinstance(image, str):
+            image = Image.open(image)
+
         # Ensure RGB
         if image.mode != "RGB":
             image = image.convert("RGB")
@@ -177,6 +198,7 @@ class SkinLesionPredictor:
 def load_predictor(
     config_path: str = "config.yaml",
     model_path: Optional[str] = None,
+    architecture: Optional[str] = None,
 ) -> SkinLesionPredictor:
     """
     Convenience function to create a SkinLesionPredictor.
@@ -191,11 +213,13 @@ def load_predictor(
         model_path = config["inference"]["model_path"]
 
     device = config["inference"].get("device", "auto")
+    arch = architecture if architecture else config["advanced"].get("active_architecture", "resnet50")
 
     return SkinLesionPredictor(
         model_path=model_path,
         config=config,
         device=device,
+        architecture=arch
     )
 
 

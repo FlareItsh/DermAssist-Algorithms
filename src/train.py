@@ -7,6 +7,7 @@ early stopping, and model checkpointing.
 Usage:
     python -m src.train
     python -m src.train --config config.yaml
+    python -m src.train --resume
 """
 
 import os
@@ -43,14 +44,14 @@ class Trainer:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
-        print("=" * 60)
-        print("  DermAssist — Skin Lesion Detection Training")
-        print("=" * 60)
+        print("-" * 60)
+        print("  DermAssist - Skin Lesion Detection Training")
+        print("-" * 60)
         print(f"  Device: {self.device}")
         print(f"  Epochs: {config['training']['epochs']}")
         print(f"  Batch:  {config['training']['batch_size']}")
         print(f"  LR:     {config['training']['learning_rate']}")
-        print("=" * 60)
+        print("-" * 60)
 
         # ---- Data ----
         self.train_loader, self.val_loader, self.class_names = \
@@ -75,6 +76,7 @@ class Trainer:
         )
 
         # ---- Tracking ----
+        self.start_epoch = 0
         self.best_val_acc = 0.0
         self.patience_counter = 0
         self.history = {
@@ -91,6 +93,32 @@ class Trainer:
         )
 
     # ---------------------------------------------------------
+    # Resume from checkpoint
+    # ---------------------------------------------------------
+    def load_checkpoint(self, checkpoint_path: str = None):
+        """Load model, optimizer, and scheduler state from a checkpoint."""
+        if checkpoint_path is None:
+            # Try to find the latest checkpoint in the checkpoint_dir
+            ckpt_dir = self.config["training"]["checkpoint_dir"]
+            ckpts = list(Path(ckpt_dir).glob("checkpoint_epoch_*.pth"))
+            if not ckpts:
+                print("  ! No checkpoints found to resume. Starting from scratch.")
+                return
+            # Sort by epoch number
+            ckpts.sort(key=lambda x: int(x.stem.split("_")[-1]))
+            checkpoint_path = str(ckpts[-1])
+
+        print(f"  -> Resuming from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.start_epoch = checkpoint["epoch"] + 1
+        self.best_val_acc = checkpoint.get("val_acc", 0.0)
+        
+        print(f"  -> Restarting from Epoch {self.start_epoch}")
+
+    # ---------------------------------------------------------
     # Train one epoch
     # ---------------------------------------------------------
     def train_one_epoch(self, epoch: int) -> tuple:
@@ -102,7 +130,7 @@ class Trainer:
 
         pbar = tqdm(
             self.train_loader,
-            desc=f"Epoch {epoch + 1} [Train]",
+            desc=f"Epoch {epoch + 1:3d} [Train] ",
             leave=False,
         )
 
@@ -119,25 +147,19 @@ class Trainer:
             loss.backward()
             self.optimizer.step()
 
-            # Metrics
+            # Stats
             running_loss += loss.item() * images.size(0)
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
-
-            pbar.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "acc": f"{100.0 * correct / total:.1f}%",
-            })
 
         avg_loss = running_loss / total
         accuracy = 100.0 * correct / total
         return avg_loss, accuracy
 
     # ---------------------------------------------------------
-    # Validate one epoch
+    # Validate
     # ---------------------------------------------------------
-    @torch.no_grad()
     def validate(self, epoch: int) -> tuple:
         """Run validation. Returns (avg_loss, accuracy)."""
         self.model.eval()
@@ -155,8 +177,9 @@ class Trainer:
             images = images.to(self.device)
             labels = labels.to(self.device)
 
-            outputs = self.model(images)
-            loss = self.criterion(outputs, labels)
+            with torch.no_grad():
+                outputs = self.model(images)
+                loss = self.criterion(outputs, labels)
 
             running_loss += loss.item() * images.size(0)
             _, predicted = outputs.max(1)
@@ -179,6 +202,7 @@ class Trainer:
             "val_acc": val_acc,
             "class_names": self.class_names,
             "config": self.config,
+            "architecture": self.config["advanced"].get("active_architecture", "resnet50"),
         }
 
         # Save periodic checkpoint
@@ -190,16 +214,19 @@ class Trainer:
 
         # Save best model for production
         if is_best:
-            prod_path = self.config["training"]["production_model_path"]
+            arch_name = self.config["advanced"].get("active_architecture", "resnet50")
+            prod_path = os.path.join(
+                os.path.dirname(self.config["training"]["production_model_path"]),
+                f"best_model_{arch_name}.pth"
+            )
             torch.save(checkpoint, prod_path)
-            print(f"  ★ Best model saved → {prod_path} "
+            print(f"  * Best model saved -> {prod_path} "
                   f"(val_acc={val_acc:.2f}%)")
 
     # ---------------------------------------------------------
     # Plot training history
     # ---------------------------------------------------------
     def plot_history(self):
-        """Save training curves as a PNG image."""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
         epochs_range = range(1, len(self.history["train_loss"]) + 1)
@@ -230,18 +257,18 @@ class Trainer:
     # ---------------------------------------------------------
     # Full training loop
     # ---------------------------------------------------------
-    def train(self):
+    def train(self, epochs_override: Optional[int] = None):
         """Execute the full training loop."""
-        epochs = self.config["training"]["epochs"]
+        total_epochs = epochs_override if epochs_override is not None else self.config["training"]["epochs"]
         patience = self.config["training"]["early_stopping_patience"]
 
-        print(f"\n{'─' * 60}")
-        print(f"  Starting training for {epochs} epochs...")
-        print(f"{'─' * 60}\n")
+        print(f"\n{'-' * 60}")
+        print(f"  Training from Epoch {self.start_epoch + 1} to {total_epochs}...")
+        print(f"{'-' * 60}\n")
 
         start_time = time.time()
 
-        for epoch in range(epochs):
+        for epoch in range(self.start_epoch, total_epochs):
             # Train
             train_loss, train_acc = self.train_one_epoch(epoch)
 
@@ -260,9 +287,9 @@ class Trainer:
 
             # Print epoch summary
             print(
-                f"  Epoch {epoch + 1:3d}/{epochs} │ "
-                f"Train Loss: {train_loss:.4f}  Acc: {train_acc:6.2f}% │ "
-                f"Val Loss: {val_loss:.4f}  Acc: {val_acc:6.2f}% │ "
+                f"  Epoch {epoch + 1:3d}/{total_epochs} | "
+                f"Train Loss: {train_loss:.4f}  Acc: {train_acc:6.2f}% | "
+                f"Val Loss: {val_loss:.4f}  Acc: {val_acc:6.2f}% | "
                 f"LR: {current_lr:.6f}"
             )
 
@@ -279,24 +306,19 @@ class Trainer:
 
             # Early stopping
             if self.patience_counter >= patience:
-                print(f"\n  ⚠ Early stopping triggered after {epoch + 1} epochs "
-                      f"(no improvement for {patience} epochs)")
+                print(f"\n  ! Early stopping triggered after {epoch + 1} epochs")
                 break
 
         elapsed = time.time() - start_time
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
 
-        print(f"\n{'═' * 60}")
+        print(f"\n{'=' * 60}")
         print(f"  Training Complete!")
         print(f"  Duration:       {minutes}m {seconds}s")
         print(f"  Best Val Acc:   {self.best_val_acc:.2f}%")
-        print(f"  Best Model:     {self.config['training']['production_model_path']}")
-        print(f"{'═' * 60}\n")
-
-        # Save training curves
+        print(f"{'=' * 60}\n")
         self.plot_history()
-
         return self.history
 
 
@@ -312,11 +334,27 @@ def main():
         "--config", type=str, default="config.yaml",
         help="Path to configuration YAML file"
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume training from latest checkpoint"
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, default=None,
+        help="Specific checkpoint path to resume from"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None,
+        help="Override number of training epochs"
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
     trainer = Trainer(config)
-    trainer.train()
+    
+    if args.resume or args.checkpoint:
+        trainer.load_checkpoint(args.checkpoint)
+        
+    trainer.train(epochs_override=args.epochs)
 
 
 if __name__ == "__main__":

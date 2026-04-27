@@ -20,6 +20,73 @@ import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
+import numpy as np
+
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+
+
+# ============================================================
+# Advanced Skin Image Filters (Thesis Roadmap)
+# ============================================================
+
+class HairRemoval:
+    """
+    DullRazor algorithm implementation for hair removal in dermoscopy images.
+    Uses morphological closing and inpainting.
+    """
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if not OPENCV_AVAILABLE:
+            return img # Fallback to original image if cv2 is missing
+            
+        # Convert PIL to OpenCV (BGR)
+        img_np = np.array(img.convert("RGB"))
+        img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # 1. Grayscale conversion
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+
+        # 2. Morphological closing to find hair structures
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
+        blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+
+        # 3. Thresholding to create a mask of the hair
+        _, mask = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
+
+        # 4. Inpainting to fill in the hair areas
+        dst = cv2.inpaint(img_cv, mask, 1, cv2.INPAINT_TELEA)
+
+        # Convert back to PIL
+        return Image.fromarray(cv2.cvtColor(dst, cv2.COLOR_BGR2RGB))
+
+
+class ColorConstancy:
+    """
+    Gray World algorithm for color constancy. 
+    Standardizes skintones across different lighting conditions.
+    """
+    def __call__(self, img: Image.Image) -> Image.Image:
+        img_np = np.array(img.convert("RGB")).astype(float)
+        
+        # Calculate mean for each channel
+        avg_r = np.mean(img_np[:, :, 0])
+        avg_g = np.mean(img_np[:, :, 1])
+        avg_b = np.mean(img_np[:, :, 2])
+        
+        # Calculate gray world constant
+        avg_gray = (avg_r + avg_g + avg_b) / 3
+        
+        # Scale each channel
+        img_np[:, :, 0] *= (avg_gray / avg_r)
+        img_np[:, :, 1] *= (avg_gray / avg_g)
+        img_np[:, :, 2] *= (avg_gray / avg_b)
+        
+        # Clip and convert back
+        img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+        return Image.fromarray(img_np)
 
 
 # ============================================================
@@ -38,29 +105,50 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
 def get_train_transforms(config: dict) -> transforms.Compose:
     """
-    Build the training transform pipeline.
+    Build the training transform pipeline with Clinical Augmentation.
 
-    Includes data augmentation (random flips, rotation, color jitter)
-    followed by normalization with ImageNet statistics.
+    Includes standard flips/rotations PLUS phone-simulation transforms:
+    - Gaussian Blur (simulates camera shake/out-of-focus)
+    - Perspective shifts (simulates angled phone shots)
+    - Color Jitter & Random Grayscale (simulates low light)
+    - Sharpness adjustment (simulates phone software processing)
     """
     img_size = config["data"]["image_size"]
     mean = config["data"]["mean"]
     std = config["data"]["std"]
 
-    return transforms.Compose([
+    pipeline = []
+    
+    # ---- Advanced Preprocessing (Thesis Feature) ----
+    if OPENCV_AVAILABLE:
+        if config.get("advanced", {}).get("hair_removal_enabled", False):
+            pipeline.append(HairRemoval())
+        
+        if config.get("advanced", {}).get("skintone_filtering_enabled", True):
+            pipeline.append(ColorConstancy())
+    else:
+        print("[DataLoader] ⚠ OpenCV not found. Skipping Hair Removal and Skintone Filtering.")
+
+    pipeline.extend([
         transforms.Resize((img_size, img_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.3),
-        transforms.RandomRotation(degrees=20),
+        transforms.RandomRotation(degrees=30),
+        transforms.RandomPerspective(distortion_scale=0.2, p=0.4),
         transforms.ColorJitter(
-            brightness=0.2,
-            contrast=0.2,
-            saturation=0.2,
-            hue=0.1
+            brightness=0.4,
+            contrast=0.4,
+            saturation=0.3,
+            hue=0.15
         ),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.3),
+        transforms.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 1.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
+
+    return transforms.Compose(pipeline)
 
 
 def get_val_transforms(config: dict) -> transforms.Compose:
@@ -73,11 +161,23 @@ def get_val_transforms(config: dict) -> transforms.Compose:
     mean = config["data"]["mean"]
     std = config["data"]["std"]
 
-    return transforms.Compose([
+    pipeline = []
+    
+    # ---- Match training preprocessing ----
+    if OPENCV_AVAILABLE:
+        if config.get("advanced", {}).get("hair_removal_enabled", False):
+            pipeline.append(HairRemoval())
+        
+        if config.get("advanced", {}).get("skintone_filtering_enabled", True):
+            pipeline.append(ColorConstancy())
+
+    pipeline.extend([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
+
+    return transforms.Compose(pipeline)
 
 
 # ============================================================
@@ -264,4 +364,4 @@ if __name__ == "__main__":
     cfg = load_config("config.yaml")
     print("Train Transforms:", get_train_transforms(cfg))
     print("Val Transforms:  ", get_val_transforms(cfg))
-    print(f"Config loaded — expecting {cfg['model']['num_classes']} classes")
+    print(f"Config loaded - expecting {cfg['model']['num_classes']} classes")

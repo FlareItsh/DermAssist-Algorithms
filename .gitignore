@@ -26,8 +26,10 @@ env/
 # --- Data & Models (large files) ---
 data/raw/*
 data/processed/*
+data/*_Backup/
 models/checkpoints/*
 models/production/*.pth
+models/*_backup/
 !**/.gitkeep
 
 # --- Training Artifacts ---
