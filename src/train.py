@@ -15,6 +15,7 @@ import sys
 import argparse
 import time
 from pathlib import Path
+from typing import Optional
 
 import yaml
 import torch
@@ -346,9 +347,31 @@ def main():
         "--epochs", type=int, default=None,
         help="Override number of training epochs"
     )
+    parser.add_argument(
+        "--arch", type=str, default=None,
+        help="Override architecture (resnet50, efficientnet_v2, swin_transformer)"
+    )
+    parser.add_argument(
+        "--name", type=str, default=None,
+        help="Override output model filename"
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
+
+    # Apply command-line overrides to config
+    if args.arch:
+        if "advanced" not in config:
+            config["advanced"] = {}
+        config["advanced"]["active_architecture"] = args.arch
+        print(f"[Train] Architecture override: {args.arch}")
+
+    if args.name:
+        # Update the production model path filename
+        prod_path = config["training"]["production_model_path"]
+        prod_dir = os.path.dirname(prod_path)
+        config["training"]["production_model_path"] = os.path.join(prod_dir, args.name)
+        print(f"[Train] Model name override: {args.name}")
     trainer = Trainer(config)
     
     if args.resume or args.checkpoint:
