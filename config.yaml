@@ -7,7 +7,7 @@ advanced:
 api:
   host: 0.0.0.0
   max_file_size_mb: 10
-  port: 8000
+  port: 8001
 data:
   image_size: 224
   mean:

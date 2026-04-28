@@ -64,13 +64,17 @@ def init_predictor_sync():
             
         active_arch = config["inference"].get("active_inference_model", "resnet50")
         
-        # FORCE LEGACY LOCK for stability during training
-        model_path = os.path.join("models/production", "best_3class_legacy.pth")
-        active_arch = "resnet50"
+        # Use config path, fallback to legacy if specifically requested
+        model_path = config["training"].get("production_model_path", os.path.join("models/production", "best_model.pth"))
         
+        # Check if model exists
         if not os.path.exists(model_path):
-            print(f"[API] ❌ ERROR: Legacy model {model_path} missing!")
-            return None
+            legacy_path = os.path.join("models/production", "best_3class_legacy.pth")
+            if os.path.exists(legacy_path):
+                model_path = legacy_path
+            else:
+                print(f"[API] ⚠ WARNING: No model found at {model_path}. Predict endpoint will be disabled.")
+                return None
 
         print(f"[API] ⏳ LOADING MODEL: {active_arch.upper()} from {model_path}")
         
@@ -163,4 +167,13 @@ async def predict(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run("api.app:app", host="0.0.0.0", port=8000, reload=True)
+    # Load port from config
+    try:
+        with open("config.yaml", "r") as f:
+            config = yaml.safe_load(f)
+            port = config["api"].get("port", 8001)
+    except:
+        port = 8001
+
+    print(f"[API] Starting server on port {port}...")
+    uvicorn.run("api.app:app", host="0.0.0.0", port=port, reload=True)
