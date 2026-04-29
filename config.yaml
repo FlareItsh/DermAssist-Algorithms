@@ -46,5 +46,5 @@ training:
   learning_rate: 0.001
   lr_gamma: 0.1
   lr_step_size: 7
-  production_model_path: models/production/best_model.pth
+  production_model_path: models/production/best_model_resnet50.pth
   weight_decay: 0.0001
