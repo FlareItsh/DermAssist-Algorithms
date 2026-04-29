@@ -101,9 +101,15 @@ class Trainer:
         if checkpoint_path is None:
             # Try to find the latest checkpoint in the checkpoint_dir
             ckpt_dir = self.config["training"]["checkpoint_dir"]
-            ckpts = list(Path(ckpt_dir).glob("checkpoint_epoch_*.pth"))
+            arch = self.config["advanced"].get("active_architecture", "resnet50")
+            ckpts = list(Path(ckpt_dir).glob(f"checkpoint_{arch}_epoch_*.pth"))
+            
+            # Fallback for old checkpoint naming convention (without arch name)
+            if not ckpts and arch == "resnet50":
+                ckpts = list(Path(ckpt_dir).glob("checkpoint_epoch_*.pth"))
+                
             if not ckpts:
-                print("  ! No checkpoints found to resume. Starting from scratch.")
+                print(f"  ! No checkpoints found for {arch} to resume. Starting from scratch.")
                 return
             # Sort by epoch number
             ckpts.sort(key=lambda x: int(x.stem.split("_")[-1]))
@@ -207,9 +213,10 @@ class Trainer:
         }
 
         # Save periodic checkpoint
+        arch_name = self.config["advanced"].get("active_architecture", "resnet50")
         ckpt_path = os.path.join(
             self.config["training"]["checkpoint_dir"],
-            f"checkpoint_epoch_{epoch + 1}.pth",
+            f"checkpoint_{arch_name}_epoch_{epoch + 1}.pth",
         )
         torch.save(checkpoint, ckpt_path)
 
