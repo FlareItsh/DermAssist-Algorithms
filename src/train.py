@@ -51,7 +51,15 @@ class Trainer:
         print(f"  Device: {self.device}")
         print(f"  Epochs: {config['training']['epochs']}")
         print(f"  Batch:  {config['training']['batch_size']}")
-        print(f"  LR:     {config['training']['learning_rate']}")
+        lr = config["training"]["learning_rate"]
+        arch = config["advanced"].get("active_architecture", "resnet50")
+
+        # Transformers need a much lower learning rate than CNNs
+        if arch == "swin_transformer" and lr > 1e-4:
+            print(f"  ! Auto-adjusting LR for Swin Transformer: {lr} -> 0.00005")
+            lr = 0.00005
+
+        print(f"  LR:     {lr}")
         print("-" * 60)
 
         # ---- Data ----
@@ -63,9 +71,11 @@ class Trainer:
 
         # ---- Loss & Optimizer ----
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(
+        
+        # Using AdamW for better stability (standard for Transformers)
+        self.optimizer = optim.AdamW(
             self.model.parameters(),
-            lr=config["training"]["learning_rate"],
+            lr=lr,
             weight_decay=config["training"]["weight_decay"],
         )
 
@@ -152,6 +162,10 @@ class Trainer:
             # Backward
             self.optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping to prevent explosions (crucial for Transformers)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
             self.optimizer.step()
 
             # Stats

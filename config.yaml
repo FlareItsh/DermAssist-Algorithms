@@ -11,16 +11,16 @@ api:
 data:
   image_size: 224
   mean:
-  - 0.485
-  - 0.456
-  - 0.406
+    - 0.485
+    - 0.456
+    - 0.406
   num_workers: 4
   processed_dir: data/processed
   raw_dir: data/raw
   std:
-  - 0.229
-  - 0.224
-  - 0.225
+    - 0.229
+    - 0.224
+    - 0.225
   train_split: 0.8
 inference:
   active_inference_model: resnet50
@@ -32,9 +32,9 @@ inference:
 model:
   backbone: resnet50
   class_names:
-  - Acne
-  - Eczema
-  - Herpes
+    - Acne
+    - Eczema
+    - Herpes
   dropout_rate: 0.5
   num_classes: 3
   pretrained: true
