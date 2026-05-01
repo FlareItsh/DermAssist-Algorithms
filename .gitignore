@@ -26,6 +26,8 @@ env/
 # --- Data & Models (large files) ---
 data/raw/*
 data/processed/*
+data/test/*
+data/results/*
 data/*_Backup/
 models/checkpoints/*
 models/production/*.pth
