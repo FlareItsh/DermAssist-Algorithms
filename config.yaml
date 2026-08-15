@@ -1,9 +1,33 @@
 advanced:
-  active_architecture: resnet50
-  hair_removal_enabled: false
+  active_architecture: swin_transformer
+  hair_removal_enabled: true
   metadata_fusion_enabled: false
   segmentation_enabled: false
-  skintone_filtering_enabled: false
+  skintone_filtering_enabled: true
+validation:
+  skin_validator_enabled: true
+  clip_model: openai/clip-vit-base-patch32
+  # Slightly lower threshold because dermoscopic images have a large
+  # dark circular border/vignette that reduces visible skin area,
+  # which can make CLIP score them lower than normal camera photos.
+  skin_confidence_threshold: 0.75
+  skin_prompts:
+    # --- Normal camera photos ---
+    - "a close-up photo of human skin with a rash or lesion"
+    - "a skin disease on a human body"
+    - "a photo of skin inflammation, wound, or discoloration on a person"
+    - "a macro photograph of a skin condition taken with a smartphone"
+    # --- Dermoscopic images ---
+    - "a dermoscopy image of a skin lesion with a circular dark border"
+    - "a dermatoscope image showing skin pigmentation and lesion structure"
+    - "a medical dermoscopy photograph of a mole or skin growth"
+    - "a polarized light dermoscopy image of a skin condition"
+  non_skin_prompts:
+    - "a photo of an object, animal, food, or outdoor scene"
+    - "a photo of a document, screen, or text"
+    - "a photo of a vehicle, building, or landscape"
+    - "a selfie or portrait photo of a person's face without any visible skin condition"
+    - "an x-ray, MRI, or internal medical scan"
 api:
   host: 0.0.0.0
   max_file_size_mb: 10
@@ -23,6 +47,7 @@ data:
     - 0.225
   train_split: 0.8
 inference:
+  ensemble_enabled: true
   active_inference_model: swin_transformer
   collection_dir: data/dataset_queue
   collection_threshold: 0.4
@@ -41,8 +66,8 @@ model:
 training:
   batch_size: 32
   checkpoint_dir: models/checkpoints
-  early_stopping_patience: 5
-  epochs: 25
+  early_stopping_patience: 10
+  epochs: 10
   learning_rate: 0.001
   lr_gamma: 0.1
   lr_step_size: 7
