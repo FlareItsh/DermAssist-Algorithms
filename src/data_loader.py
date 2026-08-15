@@ -237,8 +237,11 @@ class SkinLesionDataset(Dataset):
             cls_dir = self.data_dir / cls_name
             if not cls_dir.is_dir():
                 continue
-            for img_path in cls_dir.iterdir():
-                if img_path.suffix.lower() in valid_extensions:
+            # Scan recursively to support subdirectories (e.g. normal_camera vs dermoscopic)
+            for img_path in cls_dir.rglob("*"):
+                if img_path.is_file() and img_path.suffix.lower() in valid_extensions:
+                    if img_path.name.lower().startswith("aug_"):
+                        continue
                     self.samples.append((str(img_path), self.class_to_idx[cls_name]))
 
         print(f"[DataLoader] Loaded {len(self.samples)} images "
@@ -295,16 +298,76 @@ def create_dataloaders(
     )
     discovered_classes = full_dataset.classes
 
-    # Split into train / validation
-    total = len(full_dataset)
-    train_size = int(total * train_split)
-    val_size = total - train_size
+    # Split into train / validation using group-based splitting to prevent data leakage of augmented images
+    from collections import defaultdict
+    import random
 
-    train_subset, val_subset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
+    def get_image_group(file_path: str) -> str:
+        filename = os.path.basename(file_path)
+        name, _ = os.path.splitext(filename)
+        if name.startswith("aug_"):
+            parts = name.split("_")
+            if len(parts) > 2 and parts[1].isdigit():
+                idx = 2
+                while idx < len(parts) and parts[idx].isdigit():
+                    idx += 1
+                return "_".join(parts[idx:])
+        return name
+
+    # Group sample indices by original image ID
+    groups = defaultdict(list)
+    for idx, (img_path, _) in enumerate(full_dataset.samples):
+        group_name = get_image_group(img_path)
+        groups[group_name].append(idx)
+
+    # Shuffle groups deterministically
+    group_names = sorted(list(groups.keys()))
+    rng = random.Random(42)
+    rng.shuffle(group_names)
+
+    # Decide which groups go to train and which to val.
+    # Two-pass approach: accumulate groups into train until the target is reached,
+    # then put the remaining groups into val. All augmentations of a single
+    # source image always land in the same split, preventing data leakage.
+    target_train_count = int(len(full_dataset) * train_split)
+    cumulative = 0
+    train_group_names = set()
+
+    for group_name in group_names:
+        group_size = len(groups[group_name])
+        if cumulative < target_train_count:
+            train_group_names.add(group_name)
+            cumulative += group_size
+        # Once we've hit the target, remaining groups go to val automatically
+
+    train_indices = []
+    val_indices = []
+    for group_name in group_names:
+        indices = groups[group_name]
+        if group_name in train_group_names:
+            train_indices.extend(indices)
+        else:
+            val_indices.extend(indices)
+
+    # Safety check: ensure val is not empty (edge case with very few groups)
+    if not val_indices and train_indices:
+        # Move the last group from train to val
+        last_group = group_names[-1]
+        moved = groups[last_group]
+        train_indices = [i for i in train_indices if i not in set(moved)]
+        val_indices = list(moved)
+
+    train_size = len(train_indices)
+    val_size = len(val_indices)
+
+    print(
+        f"[DataLoader] Group split — unique source groups: {len(groups)} | "
+        f"train groups: {len(train_group_names)} | "
+        f"val groups: {len(groups) - len(train_group_names)}"
     )
+
+    train_subset = torch.utils.data.Subset(full_dataset, train_indices)
+    val_subset = torch.utils.data.Subset(full_dataset, val_indices)
 
     # Wrap subsets with appropriate transforms
     train_dataset = TransformSubset(train_subset, train_transform)

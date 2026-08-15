@@ -22,11 +22,12 @@ import yaml
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torchvision import transforms as T
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data_loader import get_val_transforms, load_config
+from src.data_loader import get_val_transforms, load_config, HairRemoval, ColorConstancy
 from src.model import SkinLesionClassifier
 
 
@@ -190,6 +191,134 @@ class SkinLesionPredictor:
 
         return results
 
+
+# ============================================================
+# Ensemble Predictor
+# ============================================================
+
+class EnsemblePredictor:
+    """
+    Loads multiple trained models and averages their predictions
+    using Test-Time Augmentation (TTA) for maximum accuracy.
+    """
+
+    # TTA augmentations applied to each image at inference time.
+    # Running 5 slight variations and averaging them effectively
+    # gives the model more "looks" at the image, reducing noise.
+    _TTA_TRANSFORMS = [
+        T.Compose([]),  # Original
+        T.Compose([T.RandomHorizontalFlip(p=1.0)]),  # Flipped
+        T.Compose([T.RandomResizedCrop(224, scale=(0.85, 1.0))]),  # Slight zoom
+        T.Compose([T.ColorJitter(brightness=0.15, contrast=0.15)]),  # Brightness shift
+        T.Compose([T.RandomRotation(degrees=10)]),  # Slight rotation
+    ]
+
+    def __init__(
+        self,
+        model_paths_and_archs: list[Tuple[str, str]],
+        config: dict,
+        device: Optional[str] = None,
+    ):
+        """
+        Args:
+            model_paths_and_archs: List of tuples (model_path, architecture).
+            config: Parsed config.yaml dictionary.
+            device: Target device ("cuda", "cpu", or "auto").
+        """
+        self.predictors = []
+        for path, arch in model_paths_and_archs:
+            if os.path.exists(path):
+                self.predictors.append(
+                    SkinLesionPredictor(
+                        model_path=path,
+                        config=config,
+                        device=device,
+                        architecture=arch,
+                    )
+                )
+            else:
+                print(f"[Ensemble] ⚠ WARNING: Model not found at {path}, skipping.")
+        
+        if not self.predictors:
+            raise ValueError("No valid models found for the ensemble!")
+            
+        self.class_names = self.predictors[0].class_names
+        self.architecture = f"ensemble ({', '.join([arch for _, arch in model_paths_and_archs])})"
+        self.device = self.predictors[0].device
+        print(f"[Ensemble] ✓ Loaded {len(self.predictors)} models with TTA ({len(self._TTA_TRANSFORMS)} augmentations).")
+
+    def _tta_predict(self, predictor: SkinLesionPredictor, image: Image.Image) -> dict:
+        """
+        Run a single predictor over all TTA variants and average the probabilities.
+        """
+        # 1. Apply high-res preprocessing ONCE on the original image first
+        preprocessed_image = image
+        has_hair_removal = any(isinstance(t, HairRemoval) for t in predictor.transform.transforms)
+        has_color_constancy = any(isinstance(t, ColorConstancy) for t in predictor.transform.transforms)
+        
+        if has_hair_removal:
+            preprocessed_image = HairRemoval()(preprocessed_image)
+        if has_color_constancy:
+            preprocessed_image = ColorConstancy()(preprocessed_image)
+
+        # Resize once to the standard size before TTA crops/flips
+        base_image = preprocessed_image.resize((224, 224))
+        
+        # 2. Backup the predictor's transform and temporarily remove high-res steps
+        original_transform = predictor.transform
+        clean_transforms = [
+            t for t in original_transform.transforms
+            if not isinstance(t, (HairRemoval, ColorConstancy))
+        ]
+        predictor.transform = T.Compose(clean_transforms)
+        
+        try:
+            accumulated = {cls: 0.0 for cls in self.class_names}
+            for aug in self._TTA_TRANSFORMS:
+                augmented = aug(base_image)
+                result = predictor.predict(augmented)
+                for cls in self.class_names:
+                    accumulated[cls] += result["all_probabilities"][cls]
+
+            num_augs = len(self._TTA_TRANSFORMS)
+            return {cls: accumulated[cls] / num_augs for cls in self.class_names}
+        finally:
+            # 3. Restore the original transform
+            predictor.transform = original_transform
+
+    def predict(self, image: Union[Image.Image, str]) -> dict:
+        """
+        Run inference across all models and TTA variants, then average probabilities.
+        """
+        if isinstance(image, str):
+            image = Image.open(image)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # Accumulate TTA-averaged probabilities across all models
+        avg_probs = {cls: 0.0 for cls in self.class_names}
+        
+        for predictor in self.predictors:
+            tta_result = self._tta_predict(predictor, image)
+            for cls in self.class_names:
+                avg_probs[cls] += tta_result[cls]
+
+        # Average across models
+        num_models = len(self.predictors)
+        for cls in self.class_names:
+            avg_probs[cls] = round(avg_probs[cls] / num_models, 4)
+
+        # Find winner
+        best_class = max(avg_probs, key=avg_probs.get)
+        best_confidence = avg_probs[best_class]
+        class_idx = self.class_names.index(best_class)
+
+        return {
+            "label": best_class,
+            "confidence": best_confidence,
+            "class_index": class_idx,
+            "all_probabilities": avg_probs,
+        }
 
 # ============================================================
 # Factory Function
