@@ -417,6 +417,9 @@ async def cancel_training():
     """Cancel current training session safely."""
     success = training_manager.cancel_training()
     if not success:
+        current_status = training_manager.get_status().get("status")
+        if current_status in ["cancelling", "cancelled", "idle", "completed", "failed"]:
+            return {"message": "Training is not actively running.", "status": current_status}
         raise HTTPException(status_code=400, detail="No active training session to cancel.")
     return {"message": "Cancellation request submitted.", "status": "cancelling"}
 

@@ -36,7 +36,7 @@ class TrainingManager:
 
     def __init__(self, config_path: str = "config.yaml"):
         self.config_path = config_path
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
         self._stop_requested = threading.Event()
 
@@ -257,14 +257,19 @@ class TrainingManager:
         return True
 
     def cancel_training(self) -> bool:
-        """Request training cancellation."""
+        """Request training cancellation safely and idempotently."""
         with self._lock:
-            if self.state["status"] not in ["syncing", "training", "evaluating"]:
+            current_status = self.state.get("status")
+            if current_status in ["cancelling", "cancelled"]:
+                return True
+            if current_status not in ["syncing", "training", "evaluating"]:
                 return False
-            self.log("⚠ Cancellation requested by user...")
+            self.state["status"] = "cancelling"
             self.state["message"] = "Stopping training..."
             self._stop_requested.set()
-            return True
+
+        self.log("⚠ Cancellation requested by user...")
+        return True
 
     def _evaluate_baseline(self, model: nn.Module, val_loader, criterion, device) -> tuple:
         """Evaluate baseline accuracy before training begins."""
@@ -275,6 +280,8 @@ class TrainingManager:
 
         with torch.no_grad():
             for images, labels in val_loader:
+                if self._stop_requested.is_set():
+                    return 0.0, 0.0
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
                 loss = criterion(outputs, labels)
@@ -399,6 +406,9 @@ class TrainingManager:
                         self.state["status"] = "evaluating"
                         self.state["message"] = f"Measuring baseline for {arch.replace('_', ' ').title()}..."
                     _, baseline_acc = self._evaluate_baseline(model, val_loader, criterion, device)
+                    if self._stop_requested.is_set():
+                        self._handle_cancellation()
+                        return
                     self.log(f"Measured baseline accuracy: {baseline_acc:.2f}%")
 
                 with self._lock:
@@ -498,6 +508,9 @@ class TrainingManager:
 
                     with torch.no_grad():
                         for images, labels in val_loader:
+                            if self._stop_requested.is_set():
+                                self._handle_cancellation()
+                                return
                             images, labels = images.to(device), labels.to(device)
                             outputs = model(images)
                             loss = criterion(outputs, labels)
