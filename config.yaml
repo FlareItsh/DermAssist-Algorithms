@@ -10,7 +10,7 @@ validation:
   # Slightly lower threshold because dermoscopic images have a large
   # dark circular border/vignette that reduces visible skin area,
   # which can make CLIP score them lower than normal camera photos.
-  skin_confidence_threshold: 0.75
+  skin_confidence_threshold: 0.80
   skin_prompts:
     # --- Normal camera photos ---
     - "a close-up photo of human skin with a rash or lesion"
@@ -23,11 +23,15 @@ validation:
     - "a medical dermoscopy photograph of a mole or skin growth"
     - "a polarized light dermoscopy image of a skin condition"
   non_skin_prompts:
-    - "a photo of an object, animal, food, or outdoor scene"
-    - "a photo of a document, screen, or text"
-    - "a photo of a vehicle, building, or landscape"
-    - "a selfie or portrait photo of a person's face without any visible skin condition"
+    - "a photo of an object, household item, cloth, furniture, or gadget"
+    - "a photo of an animal, pet, dog, cat, or animal fur"
+    - "a photo of food, plant, flower, fruit, or vegetable"
+    - "a drawing, illustration, cartoon, clipart, anime, or digital graphic"
+    - "a screenshot, digital document, meme, wallpaper, icon, or text"
+    - "a photo of a vehicle, building, road, room interior, or landscape"
+    - "a selfie or portrait photo of a person wearing clothes with normal clear skin"
     - "an x-ray, MRI, or internal medical scan"
+    - "an abstract texture, pattern, wood, metal, or fabric"
 api:
   host: 0.0.0.0
   max_file_size_mb: 10

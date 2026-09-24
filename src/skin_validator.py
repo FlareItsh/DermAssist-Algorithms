@@ -80,37 +80,55 @@ class SkinValidator:
             return
 
         model_name: str = self._config.get("clip_model", "openai/clip-vit-base-patch32")
-        self._threshold: float = self._config.get("skin_confidence_threshold", 0.60)
+        self._threshold: float = self._config.get("skin_confidence_threshold", 0.80)
 
-        self._skin_prompts: list[str] = self._config.get("skin_prompts", [
-            # Normal camera
-            "a close-up photo of human skin with a rash or lesion",
-            "a skin disease on a human body",
-            "a photo of skin inflammation, wound, or discoloration on a person",
-            "a macro photograph of a skin condition taken with a smartphone",
-            # Dermoscopic
-            "a dermoscopy image of a skin lesion with a circular dark border",
-            "a dermatoscope image showing skin pigmentation and lesion structure",
-            "a medical dermoscopy photograph of a mole or skin growth",
-            "a polarized light dermoscopy image of a skin condition",
-        ])
-
-        self._non_skin_prompts: list[str] = self._config.get("non_skin_prompts", [
-            "a photo of an object, animal, food, or outdoor scene",
-            "a photo of a document, screen, or text",
-            "a photo of a vehicle, building, or landscape",
-            "a selfie or portrait photo of a person's face",
-            "an x-ray, MRI, or internal medical scan",
-        ])
-
-        # Track which skin prompts are dermoscopy-specific for image-type detection
-        self._dermoscopy_prompt_indices: list[int] = [
-            i for i, p in enumerate(self._skin_prompts)
-            if "dermoscop" in p.lower() or "dermatoscop" in p.lower()
+        # Category-specific prompt suites
+        self._lesion_prompts: list[str] = [
+            "a macro medical close-up photo of acne pimples, pustules, whiteheads, or blackheads on skin",
+            "a clinical close-up photo of red inflamed eczema dermatitis, scaly rash, flaking skin, or sores",
+            "a clinical close-up photo of herpes blisters, cold sores, or fluid-filled vesicles on skin",
+            "a clinical close-up photograph of an active diseased skin lesion, rash, or ulcer",
+            "a medical dermoscopy photograph of a diseased skin lesion or abnormal mole",
         ]
 
-        self._all_prompts: list[str] = self._skin_prompts + self._non_skin_prompts
-        self._num_skin_prompts: int = len(self._skin_prompts)
+        self._healthy_skin_prompts: list[str] = [
+            "a close-up photo of an ankle, foot, heel, leg, arm, or hand with healthy clear skin",
+            "a close-up photo of an anklet bracelet, beads, jewelry, or watch worn on healthy unblemished skin",
+            "a photograph of clean, smooth, healthy human skin with no disease, no rash, and no pimples",
+            "a photo of normal clear human skin with zero redness and zero lesions",
+        ]
+
+        self._full_body_prompts: list[str] = [
+            "a distant body photograph or portrait without a close-up lesion",
+            "a full body photo of a person or model lying down, standing, or posing",
+            "a full body photo of a person lying on a bed, mattress, or blue sheet",
+            "a nude woman or torso lying down horizontally on a mat or bed",
+            "a portrait photograph, swimsuit photo, or distant body picture",
+        ]
+
+        self._non_skin_prompts: list[str] = [
+            "a photo of an everyday object, household item, cloth, furniture, gadget, or footwear",
+            "a photo of an animal, dog, cat, pet, or animal fur",
+            "a photo of food, plant, flower, fruit, or vegetable",
+            "a screenshot, digital document, meme, wallpaper, icon, or text",
+            "a drawing, illustration, cartoon, clipart, anime, or digital graphic",
+            "a photo of a vehicle, building, road, room interior, or landscape",
+            "an abstract texture, pattern, wood, metal, or fabric",
+        ]
+
+        self._prompt_categories = {
+            "lesion": self._lesion_prompts,
+            "healthy_skin": self._healthy_skin_prompts,
+            "full_body_portrait": self._full_body_prompts,
+            "non_skin": self._non_skin_prompts,
+        }
+
+        self._all_prompts: list[str] = (
+            self._lesion_prompts
+            + self._healthy_skin_prompts
+            + self._full_body_prompts
+            + self._non_skin_prompts
+        )
 
         print(f"[SkinValidator] ⏳ Loading CLIP model: {model_name}")
 
@@ -124,9 +142,8 @@ class SkinValidator:
         self._model = CLIPModel.from_pretrained(model_name).to(self._device)
         self._model.eval()
 
-        print(f"[SkinValidator] ✅ CLIP loaded on {self._device} — "
-              f"{self._num_skin_prompts} skin prompts / "
-              f"{len(self._non_skin_prompts)} non-skin prompts")
+        print(f"[SkinValidator] ✅ Multi-Category Semantic Gate loaded on {self._device} "
+              f"({len(self._all_prompts)} prompts across 4 clinical tiers)")
 
     # ------------------------------------------------------------------
     # Public API
@@ -134,25 +151,22 @@ class SkinValidator:
 
     def validate(self, image: Union[str, Image.Image]) -> dict:
         """
-        Determine whether ``image`` is a genuine skin / lesion photo.
+        Determine the semantic clinical category of the image.
 
         Args:
             image: A PIL Image or a path to an image file.
 
         Returns:
-            A dictionary with the following keys:
-
-            * ``is_skin`` (bool): True if the image passes the gate.
-            * ``skin_score`` (float): Aggregated probability that the
-              image matches the skin prompts (0.0 – 1.0).
-            * ``reason`` (str): Human-readable explanation (useful for
-              surfacing error messages to the user).
-            * ``prompt_scores`` (dict): Per-prompt probability scores.
+            Dictionary with category ('lesion', 'healthy_skin', 'full_body_portrait', 'non_skin'),
+            is_skin, is_lesion, is_healthy_skin, reason, and confidence scores.
         """
         # When the validator is disabled, let everything through
         if not self._enabled or self._model is None:
             return {
+                "category": "lesion",
                 "is_skin": True,
+                "is_lesion": True,
+                "is_healthy_skin": False,
                 "skin_score": 1.0,
                 "reason": "Skin validator is disabled.",
                 "prompt_scores": {},
@@ -174,65 +188,77 @@ class SkinValidator:
 
         with torch.no_grad():
             outputs = self._model(**inputs)
-            # Shape: (1, num_prompts)
             logits = outputs.logits_per_image
             probs = logits.softmax(dim=1)[0]
 
-        # ---- Aggregate skin score ----
-        # Sum probability across all skin-related prompts
-        skin_probs = probs[: self._num_skin_prompts]
-        skin_score: float = skin_probs.sum().item()
+        # ---- Category Logit Pooling & Temperature Softmax ----
+        idx = 0
+        cat_max_logits: dict[str, float] = {}
+        for cat_name, prompts in self._prompt_categories.items():
+            count = len(prompts)
+            # Take the maximum matching logit for each category
+            cat_slice = logits[0, idx : idx + count]
+            cat_max_logits[cat_name] = cat_slice.max().item()
+            idx += count
 
-        # ---- Detect image type (dermoscopic vs normal camera) ----
-        # Compare average score of dermoscopy prompts vs normal-camera prompts
-        derm_indices = self._dermoscopy_prompt_indices
-        normal_indices = [
-            i for i in range(self._num_skin_prompts)
-            if i not in derm_indices
-        ]
+        # Convert category logits to probabilities using temperature scaling (T=0.6 for ultra sharp separation)
+        cat_names = list(cat_max_logits.keys())
+        cat_tensor = torch.tensor([cat_max_logits[k] for k in cat_names], device=self._device)
+        cat_probs_tensor = torch.softmax(cat_tensor / 0.6, dim=0)
+        category_scores = {k: round(cat_probs_tensor[i].item(), 4) for i, k in enumerate(cat_names)}
 
-        image_type = "unknown"
-        if derm_indices and normal_indices:
-            derm_score = probs[derm_indices].mean().item()
-            normal_score = probs[normal_indices].mean().item()
-            image_type = "dermoscopic" if derm_score > normal_score else "normal_camera"
-        elif derm_indices:
-            image_type = "dermoscopic"
-        elif normal_indices:
-            image_type = "normal_camera"
+        lesion_score = category_scores.get("lesion", 0.0)
+        healthy_score = category_scores.get("healthy_skin", 0.0)
+        full_body_score = category_scores.get("full_body_portrait", 0.0)
+        non_skin_score = category_scores.get("non_skin", 0.0)
 
-        # Per-prompt breakdown for debugging / logging
-        prompt_scores: dict[str, float] = {
-            prompt: round(probs[i].item(), 4)
-            for i, prompt in enumerate(self._all_prompts)
-        }
-
-        # ---- Decision ----
-        is_skin: bool = skin_score >= self._threshold
-
-        reason: str
-        if is_skin:
-            reason = (
-                f"Image accepted as a {image_type.replace('_', ' ')} skin photo "
-                f"(skin score: {skin_score:.2%})."
-            )
+        # ---- Strict Clinical Priority Decision Rules ----
+        if non_skin_score >= 0.30:
+            winning_category = "non_skin"
+        elif full_body_score >= 0.35:
+            winning_category = "full_body_portrait"
+        elif healthy_score >= 0.35 and lesion_score < 0.60:
+            winning_category = "healthy_skin"
+        elif lesion_score >= 0.60 and lesion_score > healthy_score and lesion_score > full_body_score and lesion_score > non_skin_score:
+            winning_category = "lesion"
         else:
-            reason = (
-                "The uploaded image does not appear to be a skin or lesion photo. "
-                "Please upload a clear, close-up photo of the affected skin area "
-                "(normal camera or dermoscope both accepted)."
-            )
+            winning_category = max(category_scores, key=category_scores.get)
+
+        is_skin = winning_category in ["lesion", "healthy_skin"]
+        is_lesion = winning_category == "lesion"
+        is_healthy_skin = winning_category == "healthy_skin"
+
+        # Detect dermoscopy vs camera
+        image_type = "normal_camera"
+        if is_lesion:
+            derm_prompt = "a medical dermoscopy photograph of a skin lesion, mole, or skin growth"
+            if derm_prompt in self._all_prompts:
+                derm_idx = self._all_prompts.index(derm_prompt)
+                if probs[derm_idx].item() > 0.25:
+                    image_type = "dermoscopic"
+
+        if winning_category == "non_skin":
+            reason = "The uploaded image does not appear to be a human skin photo."
+        elif winning_category == "full_body_portrait":
+            reason = "Full body or distant portrait photo detected. Please upload a close-up photo of the specific skin lesion."
+        elif winning_category == "healthy_skin":
+            reason = "Clear, healthy unblemished skin detected with no active disease lesions."
+        else:
+            reason = f"Active skin lesion photo accepted ({image_type})."
 
         print(
-            f"[SkinValidator] type={image_type} | "
-            f"skin_score={skin_score:.4f} | "
-            f"accepted={is_skin}"
+            f"[SkinValidator] DECISION={winning_category.upper()} | "
+            f"lesion={lesion_score:.3f} | healthy={healthy_score:.3f} | "
+            f"full_body={full_body_score:.3f} | non_skin={non_skin_score:.3f}"
         )
 
         return {
+            "category": winning_category,
             "is_skin": is_skin,
-            "skin_score": round(skin_score, 4),
+            "is_lesion": is_lesion,
+            "is_healthy_skin": is_healthy_skin,
             "image_type": image_type,
+            "skin_score": round(lesion_score + healthy_score, 4),
+            "category_scores": category_scores,
             "reason": reason,
-            "prompt_scores": prompt_scores,
         }

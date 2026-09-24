@@ -15,6 +15,9 @@ python-multipart>=0.0.6
 Pillow>=10.0.0
 opencv-python>=4.8.0
 
+# --- Vision-Language Models (CLIP skin validator) ---
+transformers>=4.35.0
+
 # --- Configuration ---
 PyYAML>=6.0
 
