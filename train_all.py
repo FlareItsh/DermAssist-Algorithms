@@ -20,13 +20,15 @@ def main():
     parser = argparse.ArgumentParser(description="DermAssist - Automated Benchmark Trainer")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
     parser.add_argument("--epochs", type=int, default=10, help="Epochs per model")
+    parser.add_argument(
+        "--models", nargs="+",
+        default=["resnet50", "efficientnet_v2", "swin_transformer"],
+        choices=["resnet50", "efficientnet_v2", "swin_transformer"],
+        help="Space-separated list of models to train"
+    )
     args = parser.parse_args()
 
-    architectures = [
-        "resnet50",
-        "efficientnet_v2",
-        "swin_transformer"
-    ]
+    architectures = args.models
     
     print("\n" + "="*60)
     print(" DERMASSIST - AUTOMATED BENCHMARK PIPELINE")

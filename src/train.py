@@ -21,7 +21,7 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -58,6 +58,10 @@ class Trainer:
         if arch == "swin_transformer" and lr > 1e-4:
             print(f"  ! Auto-adjusting LR for Swin Transformer: {lr} -> 0.00005")
             lr = 0.00005
+        # ResNet50 and EfficientNetV2 with AdamW also struggle with high LR
+        elif arch in ["resnet50", "efficientnet_v2"] and lr > 1e-4:
+            print(f"  ! Auto-adjusting LR for {arch}: {lr} -> 0.0001")
+            lr = 0.0001
 
         print(f"  LR:     {lr}")
         print("-" * 60)
@@ -70,7 +74,30 @@ class Trainer:
         self.model = build_model(config, self.device)
 
         # ---- Loss & Optimizer ----
-        self.criterion = nn.CrossEntropyLoss()
+        # Calculate class weights for training set to handle class imbalance
+        from collections import Counter
+        # Resolve training labels
+        train_labels = [
+            self.train_loader.dataset.subset.dataset.samples[i][1] 
+            for i in self.train_loader.dataset.subset.indices
+        ]
+        class_counts = Counter(train_labels)
+        total_train = len(train_labels)
+        num_classes = len(self.class_names)
+        
+        weights = []
+        for i in range(num_classes):
+            count = class_counts.get(i, 0)
+            if count == 0:
+                weights.append(1.0)
+            else:
+                weights.append(total_train / (num_classes * count))
+                
+        class_weights = torch.FloatTensor(weights).to(self.device)
+        weight_dict = {self.class_names[i]: float(f"{w:.4f}") for i, w in enumerate(weights)}
+        print(f"  Class Weights (Loss Scaling): {weight_dict}")
+
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
         
         # Using AdamW for better stability (standard for Transformers)
         self.optimizer = optim.AdamW(
@@ -80,10 +107,12 @@ class Trainer:
         )
 
         # ---- Scheduler ----
-        self.scheduler = StepLR(
+        # CosineAnnealingLR smoothly decays LR from max to ~0 over all epochs,
+        # which gives better convergence than a hard StepLR drop.
+        self.scheduler = CosineAnnealingLR(
             self.optimizer,
-            step_size=config["training"]["lr_step_size"],
-            gamma=config["training"]["lr_gamma"],
+            T_max=config["training"]["epochs"],
+            eta_min=1e-6,
         )
 
         # ---- Tracking ----
@@ -281,7 +310,14 @@ class Trainer:
     # ---------------------------------------------------------
     def train(self, epochs_override: Optional[int] = None):
         """Execute the full training loop."""
-        total_epochs = epochs_override if epochs_override is not None else self.config["training"]["epochs"]
+        if epochs_override is not None:
+            if self.start_epoch > 0:
+                # When resuming, treat the override as additional epochs to run
+                total_epochs = self.start_epoch + epochs_override
+            else:
+                total_epochs = epochs_override
+        else:
+            total_epochs = self.config["training"]["epochs"]
         patience = self.config["training"]["early_stopping_patience"]
 
         print(f"\n{'-' * 60}")

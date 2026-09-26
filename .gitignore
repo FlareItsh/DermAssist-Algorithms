@@ -41,3 +41,5 @@ training_history.png
 # --- OS ---
 .DS_Store
 Thumbs.db
+
+models/
