@@ -20,6 +20,73 @@ import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
+import numpy as np
+
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+
+
+# ============================================================
+# Advanced Skin Image Filters (Thesis Roadmap)
+# ============================================================
+
+class HairRemoval:
+    """
+    DullRazor algorithm implementation for hair removal in dermoscopy images.
+    Uses morphological closing and inpainting.
+    """
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if not OPENCV_AVAILABLE:
+            return img # Fallback to original image if cv2 is missing
+            
+        # Convert PIL to OpenCV (BGR)
+        img_np = np.array(img.convert("RGB"))
+        img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # 1. Grayscale conversion
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+
+        # 2. Morphological closing to find hair structures
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
+        blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+
+        # 3. Thresholding to create a mask of the hair
+        _, mask = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
+
+        # 4. Inpainting to fill in the hair areas
+        dst = cv2.inpaint(img_cv, mask, 1, cv2.INPAINT_TELEA)
+
+        # Convert back to PIL
+        return Image.fromarray(cv2.cvtColor(dst, cv2.COLOR_BGR2RGB))
+
+
+class ColorConstancy:
+    """
+    Gray World algorithm for color constancy. 
+    Standardizes skintones across different lighting conditions.
+    """
+    def __call__(self, img: Image.Image) -> Image.Image:
+        img_np = np.array(img.convert("RGB")).astype(float)
+        
+        # Calculate mean for each channel
+        avg_r = np.mean(img_np[:, :, 0])
+        avg_g = np.mean(img_np[:, :, 1])
+        avg_b = np.mean(img_np[:, :, 2])
+        
+        # Calculate gray world constant
+        avg_gray = (avg_r + avg_g + avg_b) / 3
+        
+        # Scale each channel
+        img_np[:, :, 0] *= (avg_gray / avg_r)
+        img_np[:, :, 1] *= (avg_gray / avg_g)
+        img_np[:, :, 2] *= (avg_gray / avg_b)
+        
+        # Clip and convert back
+        img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+        return Image.fromarray(img_np)
 
 
 # ============================================================
@@ -38,29 +105,50 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
 def get_train_transforms(config: dict) -> transforms.Compose:
     """
-    Build the training transform pipeline.
+    Build the training transform pipeline with Clinical Augmentation.
 
-    Includes data augmentation (random flips, rotation, color jitter)
-    followed by normalization with ImageNet statistics.
+    Includes standard flips/rotations PLUS phone-simulation transforms:
+    - Gaussian Blur (simulates camera shake/out-of-focus)
+    - Perspective shifts (simulates angled phone shots)
+    - Color Jitter & Random Grayscale (simulates low light)
+    - Sharpness adjustment (simulates phone software processing)
     """
     img_size = config["data"]["image_size"]
     mean = config["data"]["mean"]
     std = config["data"]["std"]
 
-    return transforms.Compose([
+    pipeline = []
+    
+    # ---- Advanced Preprocessing (Thesis Feature) ----
+    if OPENCV_AVAILABLE:
+        if config.get("advanced", {}).get("hair_removal_enabled", False):
+            pipeline.append(HairRemoval())
+        
+        if config.get("advanced", {}).get("skintone_filtering_enabled", True):
+            pipeline.append(ColorConstancy())
+    else:
+        print("[DataLoader] ⚠ OpenCV not found. Skipping Hair Removal and Skintone Filtering.")
+
+    pipeline.extend([
         transforms.Resize((img_size, img_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.3),
-        transforms.RandomRotation(degrees=20),
+        transforms.RandomRotation(degrees=30),
+        transforms.RandomPerspective(distortion_scale=0.2, p=0.4),
         transforms.ColorJitter(
-            brightness=0.2,
-            contrast=0.2,
-            saturation=0.2,
-            hue=0.1
+            brightness=0.4,
+            contrast=0.4,
+            saturation=0.3,
+            hue=0.15
         ),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.3),
+        transforms.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 1.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
+
+    return transforms.Compose(pipeline)
 
 
 def get_val_transforms(config: dict) -> transforms.Compose:
@@ -73,11 +161,23 @@ def get_val_transforms(config: dict) -> transforms.Compose:
     mean = config["data"]["mean"]
     std = config["data"]["std"]
 
-    return transforms.Compose([
+    pipeline = []
+    
+    # ---- Match training preprocessing ----
+    if OPENCV_AVAILABLE:
+        if config.get("advanced", {}).get("hair_removal_enabled", False):
+            pipeline.append(HairRemoval())
+        
+        if config.get("advanced", {}).get("skintone_filtering_enabled", True):
+            pipeline.append(ColorConstancy())
+
+    pipeline.extend([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
+
+    return transforms.Compose(pipeline)
 
 
 # ============================================================
@@ -137,8 +237,11 @@ class SkinLesionDataset(Dataset):
             cls_dir = self.data_dir / cls_name
             if not cls_dir.is_dir():
                 continue
-            for img_path in cls_dir.iterdir():
-                if img_path.suffix.lower() in valid_extensions:
+            # Scan recursively to support subdirectories (e.g. normal_camera vs dermoscopic)
+            for img_path in cls_dir.rglob("*"):
+                if img_path.is_file() and img_path.suffix.lower() in valid_extensions:
+                    if img_path.name.lower().startswith("aug_"):
+                        continue
                     self.samples.append((str(img_path), self.class_to_idx[cls_name]))
 
         print(f"[DataLoader] Loaded {len(self.samples)} images "
@@ -195,16 +298,76 @@ def create_dataloaders(
     )
     discovered_classes = full_dataset.classes
 
-    # Split into train / validation
-    total = len(full_dataset)
-    train_size = int(total * train_split)
-    val_size = total - train_size
+    # Split into train / validation using group-based splitting to prevent data leakage of augmented images
+    from collections import defaultdict
+    import random
 
-    train_subset, val_subset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
+    def get_image_group(file_path: str) -> str:
+        filename = os.path.basename(file_path)
+        name, _ = os.path.splitext(filename)
+        if name.startswith("aug_"):
+            parts = name.split("_")
+            if len(parts) > 2 and parts[1].isdigit():
+                idx = 2
+                while idx < len(parts) and parts[idx].isdigit():
+                    idx += 1
+                return "_".join(parts[idx:])
+        return name
+
+    # Group sample indices by original image ID
+    groups = defaultdict(list)
+    for idx, (img_path, _) in enumerate(full_dataset.samples):
+        group_name = get_image_group(img_path)
+        groups[group_name].append(idx)
+
+    # Shuffle groups deterministically
+    group_names = sorted(list(groups.keys()))
+    rng = random.Random(42)
+    rng.shuffle(group_names)
+
+    # Decide which groups go to train and which to val.
+    # Two-pass approach: accumulate groups into train until the target is reached,
+    # then put the remaining groups into val. All augmentations of a single
+    # source image always land in the same split, preventing data leakage.
+    target_train_count = int(len(full_dataset) * train_split)
+    cumulative = 0
+    train_group_names = set()
+
+    for group_name in group_names:
+        group_size = len(groups[group_name])
+        if cumulative < target_train_count:
+            train_group_names.add(group_name)
+            cumulative += group_size
+        # Once we've hit the target, remaining groups go to val automatically
+
+    train_indices = []
+    val_indices = []
+    for group_name in group_names:
+        indices = groups[group_name]
+        if group_name in train_group_names:
+            train_indices.extend(indices)
+        else:
+            val_indices.extend(indices)
+
+    # Safety check: ensure val is not empty (edge case with very few groups)
+    if not val_indices and train_indices:
+        # Move the last group from train to val
+        last_group = group_names[-1]
+        moved = groups[last_group]
+        train_indices = [i for i in train_indices if i not in set(moved)]
+        val_indices = list(moved)
+
+    train_size = len(train_indices)
+    val_size = len(val_indices)
+
+    print(
+        f"[DataLoader] Group split — unique source groups: {len(groups)} | "
+        f"train groups: {len(train_group_names)} | "
+        f"val groups: {len(groups) - len(train_group_names)}"
     )
+
+    train_subset = torch.utils.data.Subset(full_dataset, train_indices)
+    val_subset = torch.utils.data.Subset(full_dataset, val_indices)
 
     # Wrap subsets with appropriate transforms
     train_dataset = TransformSubset(train_subset, train_transform)
@@ -264,4 +427,4 @@ if __name__ == "__main__":
     cfg = load_config("config.yaml")
     print("Train Transforms:", get_train_transforms(cfg))
     print("Val Transforms:  ", get_val_transforms(cfg))
-    print(f"Config loaded — expecting {cfg['model']['num_classes']} classes")
+    print(f"Config loaded - expecting {cfg['model']['num_classes']} classes")

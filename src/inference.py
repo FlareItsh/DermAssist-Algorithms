@@ -16,17 +16,18 @@ Usage:
 import os
 import sys
 import argparse
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Union
 
 import yaml
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torchvision import transforms as T
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data_loader import get_val_transforms, load_config
+from src.data_loader import get_val_transforms, load_config, HairRemoval, ColorConstancy
 from src.model import SkinLesionClassifier
 
 
@@ -45,6 +46,7 @@ class SkinLesionPredictor:
         model_path: str,
         config: dict,
         device: Optional[str] = None,
+        architecture: str = "resnet50",
     ):
         """
         Args:
@@ -74,13 +76,33 @@ class SkinLesionPredictor:
         num_classes = len(self.class_names)
 
         # ---- Build model and load weights ----
+        # Priority: Checkpoint > Manual Override (architecture param) > Config
+        arch = architecture
+        if "architecture" in checkpoint:
+            arch = checkpoint["architecture"]
+        
+        self.architecture = arch
+
         self.model = SkinLesionClassifier(
             num_classes=num_classes,
-            pretrained=False,  # We're loading weights manually
+            pretrained=False,
             dropout_rate=config["model"].get("dropout_rate", 0.5),
+            architecture=arch
         )
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.model = self.model.to(self.device)
+        # ---- Deep Weight Mapping (Legacy Fix) ----
+        state_dict = checkpoint["model_state_dict"]
+        new_state_dict = {}
+        
+        # If the model has 'classifier' but checkpoint has 'backbone.fc', we bridge them
+        for key, value in state_dict.items():
+            if key.startswith("backbone.fc."):
+                new_key = key.replace("backbone.fc.", "classifier.")
+                new_state_dict[new_key] = value
+            new_state_dict[key] = value
+            
+        missing, unexpected = self.model.load_state_dict(new_state_dict, strict=False)
+        
+        self.model.to(self.device)
         self.model.eval()
 
         # ---- Build transform pipeline ----
@@ -93,20 +115,20 @@ class SkinLesionPredictor:
     # Predict a single image
     # ---------------------------------------------------------
     @torch.no_grad()
-    def predict(self, image: Image.Image) -> Dict[str, object]:
+    def predict(self, image: Union[Image.Image, str]) -> dict:
         """
-        Run inference on a single PIL Image.
+        Run inference on a single PIL Image or a path to an image.
 
         Args:
-            image: PIL Image (any size, will be resized).
+            image: PIL Image or string path.
 
         Returns:
-            Dictionary with:
-                - 'label':       Predicted class name
-                - 'confidence':  Prediction confidence (0.0 - 1.0)
-                - 'class_index': Predicted class index
-                - 'all_probabilities': Dict mapping class name → probability
+            Dictionary with prediction results.
         """
+        # If a path was provided, open it
+        if isinstance(image, str):
+            image = Image.open(image)
+
         # Ensure RGB
         if image.mode != "RGB":
             image = image.convert("RGB")
@@ -171,12 +193,141 @@ class SkinLesionPredictor:
 
 
 # ============================================================
+# Ensemble Predictor
+# ============================================================
+
+class EnsemblePredictor:
+    """
+    Loads multiple trained models and averages their predictions
+    using Test-Time Augmentation (TTA) for maximum accuracy.
+    """
+
+    # TTA augmentations applied to each image at inference time.
+    # Running 5 slight variations and averaging them effectively
+    # gives the model more "looks" at the image, reducing noise.
+    _TTA_TRANSFORMS = [
+        T.Compose([]),  # Original
+        T.Compose([T.RandomHorizontalFlip(p=1.0)]),  # Flipped
+        T.Compose([T.RandomResizedCrop(224, scale=(0.85, 1.0))]),  # Slight zoom
+        T.Compose([T.ColorJitter(brightness=0.15, contrast=0.15)]),  # Brightness shift
+        T.Compose([T.RandomRotation(degrees=10)]),  # Slight rotation
+    ]
+
+    def __init__(
+        self,
+        model_paths_and_archs: list[Tuple[str, str]],
+        config: dict,
+        device: Optional[str] = None,
+    ):
+        """
+        Args:
+            model_paths_and_archs: List of tuples (model_path, architecture).
+            config: Parsed config.yaml dictionary.
+            device: Target device ("cuda", "cpu", or "auto").
+        """
+        self.predictors = []
+        for path, arch in model_paths_and_archs:
+            if os.path.exists(path):
+                self.predictors.append(
+                    SkinLesionPredictor(
+                        model_path=path,
+                        config=config,
+                        device=device,
+                        architecture=arch,
+                    )
+                )
+            else:
+                print(f"[Ensemble] ⚠ WARNING: Model not found at {path}, skipping.")
+        
+        if not self.predictors:
+            raise ValueError("No valid models found for the ensemble!")
+            
+        self.class_names = self.predictors[0].class_names
+        self.architecture = f"ensemble ({', '.join([arch for _, arch in model_paths_and_archs])})"
+        self.device = self.predictors[0].device
+        print(f"[Ensemble] ✓ Loaded {len(self.predictors)} models with TTA ({len(self._TTA_TRANSFORMS)} augmentations).")
+
+    def _tta_predict(self, predictor: SkinLesionPredictor, image: Image.Image) -> dict:
+        """
+        Run a single predictor over all TTA variants and average the probabilities.
+        """
+        # 1. Apply high-res preprocessing ONCE on the original image first
+        preprocessed_image = image
+        has_hair_removal = any(isinstance(t, HairRemoval) for t in predictor.transform.transforms)
+        has_color_constancy = any(isinstance(t, ColorConstancy) for t in predictor.transform.transforms)
+        
+        if has_hair_removal:
+            preprocessed_image = HairRemoval()(preprocessed_image)
+        if has_color_constancy:
+            preprocessed_image = ColorConstancy()(preprocessed_image)
+
+        # Resize once to the standard size before TTA crops/flips
+        base_image = preprocessed_image.resize((224, 224))
+        
+        # 2. Backup the predictor's transform and temporarily remove high-res steps
+        original_transform = predictor.transform
+        clean_transforms = [
+            t for t in original_transform.transforms
+            if not isinstance(t, (HairRemoval, ColorConstancy))
+        ]
+        predictor.transform = T.Compose(clean_transforms)
+        
+        try:
+            accumulated = {cls: 0.0 for cls in self.class_names}
+            for aug in self._TTA_TRANSFORMS:
+                augmented = aug(base_image)
+                result = predictor.predict(augmented)
+                for cls in self.class_names:
+                    accumulated[cls] += result["all_probabilities"][cls]
+
+            num_augs = len(self._TTA_TRANSFORMS)
+            return {cls: accumulated[cls] / num_augs for cls in self.class_names}
+        finally:
+            # 3. Restore the original transform
+            predictor.transform = original_transform
+
+    def predict(self, image: Union[Image.Image, str]) -> dict:
+        """
+        Run inference across all models and TTA variants, then average probabilities.
+        """
+        if isinstance(image, str):
+            image = Image.open(image)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # Accumulate TTA-averaged probabilities across all models
+        avg_probs = {cls: 0.0 for cls in self.class_names}
+        
+        for predictor in self.predictors:
+            tta_result = self._tta_predict(predictor, image)
+            for cls in self.class_names:
+                avg_probs[cls] += tta_result[cls]
+
+        # Average across models
+        num_models = len(self.predictors)
+        for cls in self.class_names:
+            avg_probs[cls] = round(avg_probs[cls] / num_models, 4)
+
+        # Find winner
+        best_class = max(avg_probs, key=avg_probs.get)
+        best_confidence = avg_probs[best_class]
+        class_idx = self.class_names.index(best_class)
+
+        return {
+            "label": best_class,
+            "confidence": best_confidence,
+            "class_index": class_idx,
+            "all_probabilities": avg_probs,
+        }
+
+# ============================================================
 # Factory Function
 # ============================================================
 
 def load_predictor(
     config_path: str = "config.yaml",
     model_path: Optional[str] = None,
+    architecture: Optional[str] = None,
 ) -> SkinLesionPredictor:
     """
     Convenience function to create a SkinLesionPredictor.
@@ -191,11 +342,13 @@ def load_predictor(
         model_path = config["inference"]["model_path"]
 
     device = config["inference"].get("device", "auto")
+    arch = architecture if architecture else config["advanced"].get("active_architecture", "resnet50")
 
     return SkinLesionPredictor(
         model_path=model_path,
         config=config,
         device=device,
+        architecture=arch
     )
 
 

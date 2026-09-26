@@ -26,8 +26,12 @@ env/
 # --- Data & Models (large files) ---
 data/raw/*
 data/processed/*
+data/test/*
+data/results/*
+data/*_Backup/
 models/checkpoints/*
 models/production/*.pth
+models/*_backup/
 !**/.gitkeep
 
 # --- Training Artifacts ---
@@ -37,3 +41,5 @@ training_history.png
 # --- OS ---
 .DS_Store
 Thumbs.db
+
+models/
