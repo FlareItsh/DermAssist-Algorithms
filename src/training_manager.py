@@ -77,15 +77,18 @@ class TrainingManager:
         """Register a callback function to be called when a new model is promoted to production."""
         self._on_model_promoted_callbacks.append(callback)
 
-    def log(self, message: str):
-        """Append a log message thread-safely."""
+    def log(self, message: str, replace_last: bool = False):
+        """Append or update a log message thread-safely."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         entry = f"[{timestamp}] {message}"
         print(f"[TrainingManager] {entry}")
         with self._lock:
-            self.state["logs"].append(entry)
-            if len(self.state["logs"]) > 200:
-                self.state["logs"].pop(0)
+            if replace_last and len(self.state["logs"]) > 0:
+                self.state["logs"][-1] = entry
+            else:
+                self.state["logs"].append(entry)
+                if len(self.state["logs"]) > 500:
+                    self.state["logs"].pop(0)
 
     def get_status(self) -> Dict[str, Any]:
         """Return a copy of the current training status."""
@@ -312,10 +315,14 @@ class TrainingManager:
                 is_ensemble_run = False
 
             total_models = len(arch_list)
-            self.log(
-                f"Starting {'Ensemble' if is_ensemble_run else 'Single'} Training Run: "
-                f"Models={', '.join([a.upper() for a in arch_list])}, Epochs/Model={epochs}"
-            )
+            self.log("=" * 64)
+            self.log("   DERMASSIST - MULTI-MODEL BENCHMARK TRAINING PIPELINE")
+            self.log("=" * 64)
+            self.log(f"   Architecture Pipeline : {'TRI-MODEL ENSEMBLE' if is_ensemble_run else arch_list[0].upper()}")
+            self.log(f"   Active Models         : {', '.join([a.upper() for a in arch_list])}")
+            self.log(f"   Epochs Per Backbone   : {epochs} epoch(s)")
+            self.log(f"   Dataset Auto-Sync     : {'Enabled' if sync_dataset else 'Disabled'}")
+            self.log("=" * 64)
 
             # Step 1: Sync dataset if requested
             if sync_dataset:
@@ -326,7 +333,7 @@ class TrainingManager:
                 return
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.log(f"Compute device: {device}")
+            self.log(f"Compute hardware device : {str(device).upper()} (PyTorch {torch.__version__})")
 
             promoted_models = []
             results_summary = []
@@ -339,9 +346,9 @@ class TrainingManager:
                     return
 
                 model_num = arch_idx + 1
-                self.log("=" * 60)
+                self.log("-" * 64)
                 self.log(f"▶ [{model_num}/{total_models}] TRAINING BACKBONE: {arch.upper()}")
-                self.log("=" * 60)
+                self.log("-" * 64)
 
                 with self._lock:
                     self.state["status"] = "training"
@@ -471,8 +478,8 @@ class TrainingManager:
                         correct += predicted.eq(labels).sum().item()
                         step_count += 1
 
-                        if batch_idx % 5 == 0 or batch_idx == total_batches - 1:
-                            # Calculate cumulative progress across all models in ensemble
+                        # Periodic progress update & live terminal bar
+                        if batch_idx % 2 == 0 or batch_idx == total_batches - 1:
                             sub_progress = (step_count / max(total_steps, 1)) * 100.0
                             overall_progress = round(
                                 ((arch_idx * 100.0) + sub_progress) / total_models, 1
@@ -493,6 +500,23 @@ class TrainingManager:
                                 self.state["train_loss"] = round(current_train_loss, 4)
                                 self.state["train_acc"] = round(current_train_acc, 2)
                                 self.state["eta_seconds"] = eta
+
+                            # Generate ASCII progress bar for live terminal stream
+                            pct = int((batch_idx + 1) / max(total_batches, 1) * 100)
+                            bar_len = 16
+                            filled_len = int(bar_len * (batch_idx + 1) / max(total_batches, 1))
+                            bar_str = "=" * max(0, filled_len - 1) + (">" if filled_len > 0 and filled_len < bar_len else ("=" if filled_len == bar_len else ""))
+                            bar_str = bar_str.ljust(bar_len, ".")
+
+                            progress_log = (
+                                f"[STEP] Epoch {epoch + 1:2d}/{epochs:2d} [{bar_str}] {pct:3d}% "
+                                f"({batch_idx + 1}/{total_batches}) | "
+                                f"Loss: {current_train_loss:.4f} | Acc: {current_train_acc:5.2f}% | "
+                                f"Speed: {batch_duration:.2f}s/step | ETA: {eta}s"
+                            )
+                            # Update terminal line in-place for active step, or append when done with epoch
+                            is_epoch_done = (batch_idx == total_batches - 1)
+                            self.log(progress_log, replace_last=(batch_idx > 0 and not is_epoch_done))
 
                     # Validation Phase
                     scheduler.step()
