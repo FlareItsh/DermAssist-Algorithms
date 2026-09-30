@@ -323,6 +323,24 @@ async def predict(file: UploadFile = File(...)):
                     clinical_feedback="No active skin lesions detected. The skin appears healthy and unblemished.",
                 )
 
+            # Tier 4: Unsupported / Out-of-Scope Skin Condition (Psoriasis, Ringworm, Vitiligo, Melanoma, etc.)
+            if category == "unsupported_condition":
+                quality_result = quality_assessor.assess(temp_path)
+                os.remove(temp_path)
+                image_quality = ImageQuality(**quality_result.to_dict()) if quality_result else None
+                unsupported_conf = validation.get("category_scores", {}).get("unsupported_condition", 0.90)
+                return PredictionResponse(
+                    label="Inconclusive",
+                    confidence=round(unsupported_conf, 4),
+                    all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
+                    device="cpu",
+                    architecture="clip",
+                    image_type=image_type,
+                    image_quality=image_quality,
+                    is_inconclusive=True,
+                    clinical_feedback="This condition appears to be outside our 3 primary focus areas (Acne, Eczema, Herpes). It may represent an unsupported skin condition (such as Psoriasis, Ringworm, or other lesion). Please consult a licensed dermatologist for comprehensive clinical evaluation.",
+                )
+
 
         # ---- Image quality assessment (metadata only — image unchanged) ----
         # Runs on the same temp file BEFORE the predictor so we can clean up
@@ -348,8 +366,8 @@ async def predict(file: UploadFile = File(...)):
         sorted_probs = sorted(all_probs.values(), reverse=True)
         top_margin = (sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else sorted_probs[0]
 
-        # Guard triggers if top class confidence is < 58% or top-two difference is < 10% (flat/ambiguous distribution)
-        is_inconclusive = (raw_conf < 0.58) or (top_margin < 0.10)
+        # Guard triggers only if top class confidence is extremely low (< 45%) or distribution is completely flat (top margin < 5%)
+        is_inconclusive = (raw_conf < 0.45) or (top_margin < 0.05)
 
         if is_inconclusive:
             final_label = "Inconclusive"

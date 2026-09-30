@@ -167,6 +167,11 @@ class TrainingManager:
         deleted_count = 0
 
         for cat_lower, target_class_name in category_map.items():
+            # Bug fix: respect cancellation during potentially slow file sync
+            if self._stop_requested.is_set():
+                self.log("⚠ Dataset sync aborted by cancellation request.")
+                return copied_count
+
             source_folder = os.path.join(laravel_dataset_path, cat_lower)
             target_folder = os.path.join(target_raw_dir, target_class_name)
             os.makedirs(target_folder, exist_ok=True)
@@ -175,6 +180,10 @@ class TrainingManager:
             if os.path.exists(source_folder) and os.path.isdir(source_folder):
                 valid_source_fnames = set(os.listdir(source_folder))
                 for fname in valid_source_fnames:
+                    if self._stop_requested.is_set():
+                        self.log("⚠ Dataset sync aborted by cancellation request.")
+                        return copied_count
+
                     src_file = os.path.join(source_folder, fname)
                     if os.path.isfile(src_file):
                         dest_file = os.path.join(target_folder, f"webapp_{fname}")
@@ -259,8 +268,15 @@ class TrainingManager:
         self._thread.start()
         return True
 
-    def cancel_training(self) -> bool:
-        """Request training cancellation safely and idempotently."""
+    def cancel_training(self, wait_seconds: float = 30.0) -> bool:
+        """
+        Request training cancellation safely and idempotently, and wait for the worker thread to terminate.
+
+        The method signals the stop event, then joins the background thread with a
+        generous timeout so that the status is already 'cancelled' by the time the
+        API returns — preventing the race where the client polls /train/status and
+        still sees 'training' after a successful cancel call.
+        """
         with self._lock:
             current_status = self.state.get("status")
             if current_status in ["cancelling", "cancelled"]:
@@ -272,6 +288,12 @@ class TrainingManager:
             self._stop_requested.set()
 
         self.log("⚠ Cancellation requested by user...")
+
+        # Wait outside the lock so the worker thread can acquire it to write its
+        # final 'cancelled' state without deadlocking against cancel_training.
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=wait_seconds)
+
         return True
 
     def _evaluate_baseline(self, model: nn.Module, val_loader, criterion, device) -> tuple:
@@ -532,9 +554,12 @@ class TrainingManager:
 
                     with torch.no_grad():
                         for images, labels in val_loader:
+                            # Bug fix: check for cancellation inside the validation loop
+                            # so the thread doesn't keep running through a full val pass
+                            # after the user has already pressed cancel.
                             if self._stop_requested.is_set():
-                                self._handle_cancellation()
-                                return
+                                break
+
                             images, labels = images.to(device), labels.to(device)
                             outputs = model(images)
                             loss = criterion(outputs, labels)
@@ -542,6 +567,11 @@ class TrainingManager:
                             _, predicted = outputs.max(1)
                             val_total += labels.size(0)
                             val_correct += predicted.eq(labels).sum().item()
+
+                    # Propagate cancellation after breaking out of the val loop
+                    if self._stop_requested.is_set():
+                        self._handle_cancellation()
+                        return
 
                     val_duration = max(time.time() - val_start_time, 0.5)
                     avg_val_duration = (0.7 * avg_val_duration) + (0.3 * val_duration)
