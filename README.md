@@ -186,12 +186,12 @@ The API will start at `http://localhost:8000`. Interactive docs are available at
 
 ### Endpoints
 
-| Method | Endpoint         | Description                              |
-|--------|------------------|------------------------------------------|
-| POST   | `/predict`       | Classify a skin lesion image             |
-| POST   | `/predict/top-k` | Get top-K predictions                    |
-| GET    | `/health`        | Check API health and model status        |
-| GET    | `/classes`       | List supported skin lesion classes       |
+| Method | Endpoint         | Description                        |
+| ------ | ---------------- | ---------------------------------- |
+| POST   | `/predict`       | Classify a skin lesion image       |
+| POST   | `/predict/top-k` | Get top-K predictions              |
+| GET    | `/health`        | Check API health and model status  |
+| GET    | `/classes`       | List supported skin lesion classes |
 
 ### Example: POST /predict
 
@@ -207,18 +207,18 @@ curl -X POST "http://localhost:8000/predict" \
 
 ```json
 {
-    "label": "Melanoma",
-    "confidence": 0.9234,
-    "class_index": 4,
-    "all_probabilities": {
-        "Actinic keratoses": 0.0021,
-        "Basal cell carcinoma": 0.0103,
-        "Benign keratosis": 0.0187,
-        "Dermatofibroma": 0.0045,
-        "Melanoma": 0.9234,
-        "Melanocytic nevi": 0.0298,
-        "Vascular lesions": 0.0112
-    }
+  "label": "Melanoma",
+  "confidence": 0.9234,
+  "class_index": 4,
+  "all_probabilities": {
+    "Actinic keratoses": 0.0021,
+    "Basal cell carcinoma": 0.0103,
+    "Benign keratosis": 0.0187,
+    "Dermatofibroma": 0.0045,
+    "Melanoma": 0.9234,
+    "Melanocytic nevi": 0.0298,
+    "Vascular lesions": 0.0112
+  }
 }
 ```
 
@@ -239,19 +239,19 @@ print(response.json())
 
 All settings are in `config.yaml`:
 
-| Section    | Key                      | Default   | Description                        |
-|------------|--------------------------|----------|------------------------------------|
-| data       | `image_size`             | 224       | Input image resolution             |
-| data       | `train_split`            | 0.8       | Train/val split ratio              |
-| data       | `num_workers`            | 4         | DataLoader worker processes        |
-| model      | `num_classes`            | 7         | Number of disease classes          |
-| model      | `dropout_rate`           | 0.5       | Dropout probability                |
-| training   | `batch_size`             | 32        | Training batch size                |
-| training   | `epochs`                 | 25        | Maximum training epochs            |
-| training   | `learning_rate`          | 0.001     | Initial learning rate              |
-| training   | `early_stopping_patience`| 5         | Epochs before early stop           |
-| api        | `host`                   | 0.0.0.0   | API server host                    |
-| api        | `port`                   | 8000      | API server port                    |
+| Section  | Key                       | Default | Description                 |
+| -------- | ------------------------- | ------- | --------------------------- |
+| data     | `image_size`              | 224     | Input image resolution      |
+| data     | `train_split`             | 0.8     | Train/val split ratio       |
+| data     | `num_workers`             | 4       | DataLoader worker processes |
+| model    | `num_classes`             | 7       | Number of disease classes   |
+| model    | `dropout_rate`            | 0.5     | Dropout probability         |
+| training | `batch_size`              | 32      | Training batch size         |
+| training | `epochs`                  | 25      | Maximum training epochs     |
+| training | `learning_rate`           | 0.001   | Initial learning rate       |
+| training | `early_stopping_patience` | 5       | Epochs before early stop    |
+| api      | `host`                    | 0.0.0.0 | API server host             |
+| api      | `port`                    | 8000    | API server port             |
 
 ---
 
@@ -271,4 +271,4 @@ This project is part of the DermAssist platform.
 
 ---
 
-*Built with ❤️ by the DermAssist team (Flare)*
+_Built with ❤️ by the DermAssist team (FlareItsh)_
