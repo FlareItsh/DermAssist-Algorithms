@@ -96,6 +96,7 @@ class SkinValidator:
         ]
 
         # Tier B: Out-of-Scope / Unsupported Conditions — non-target diseases
+        # Each prompt maps to a concrete disease label via self._unsupported_prompt_labels
         self._unsupported_prompts: list[str] = [
             "a photo of psoriasis with thick red annular plaques, circular patches, or silvery scales on chest or torso",
             "a photo of plaque psoriasis, guttate psoriasis, or widespread red scaly skin plaques on torso",
@@ -105,6 +106,18 @@ class SkinValidator:
             "a clinical photo of hives, severe urticaria, large raised allergic welts, or swollen wheals",
             "a photo of skin warts, verruca vulgaris, skin tags, or cauliflower-like growths",
             "a photo of annular erythema, lupus rash, or extensive widespread body rash",
+        ]
+
+        # Maps each unsupported_prompts entry (by index) to its clinical disease label
+        self._unsupported_prompt_labels: list[str] = [
+            "psoriasis",
+            "psoriasis",
+            "ringworm",
+            "vitiligo",
+            "melanoma",
+            "hives",
+            "warts",
+            "lupus",
         ]
 
         # Tier C: Healthy Skin & Cosmetics
@@ -282,10 +295,29 @@ class SkinValidator:
         else:
             reason = f"Target skin lesion photo accepted ({image_type})."
 
+        # ---- Detect specific out-of-scope disease via per-prompt logits ----
+        out_of_scope_category: str | None = None
+        if winning_category == "unsupported_condition":
+            # Build logit vector for each unsupported prompt
+            unsupported_start_idx = len(self._lesion_prompts)
+            unsupported_logits = logits[0, unsupported_start_idx: unsupported_start_idx + len(self._unsupported_prompts)]
+            top_prompt_idx = int(unsupported_logits.argmax().item())
+            out_of_scope_category = self._unsupported_prompt_labels[top_prompt_idx]
+
+            # Aggregate score per disease label (in case multiple prompts point to the same label)
+            label_scores: dict[str, float] = {}
+            for i, label in enumerate(self._unsupported_prompt_labels):
+                score = unsupported_logits[i].item()
+                if label not in label_scores or score > label_scores[label]:
+                    label_scores[label] = score
+            top_label = max(label_scores, key=lambda k: label_scores[k])
+            out_of_scope_category = top_label
+
         print(
             f"[SkinValidator] DECISION={winning_category.upper()} | "
             f"target_lesion={lesion_score:.3f} | unsupported={unsupported_score:.3f} | "
             f"healthy={healthy_score:.3f} | full_body={full_body_score:.3f} | non_skin={non_skin_score:.3f}"
+            + (f" | out_of_scope_category={out_of_scope_category}" if out_of_scope_category else "")
         )
 
         return {
@@ -298,5 +330,6 @@ class SkinValidator:
             "image_type": image_type,
             "skin_score": round(lesion_score + unsupported_score + healthy_score, 4),
             "category_scores": category_scores,
+            "out_of_scope_category": out_of_scope_category,
             "reason": reason,
         }

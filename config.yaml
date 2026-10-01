@@ -42,7 +42,7 @@ data:
     - 0.485
     - 0.456
     - 0.406
-  num_workers: 4
+  num_workers: 0
   processed_dir: data/processed
   raw_dir: data/raw
   std:
