@@ -38,10 +38,12 @@ class TrainingManager:
         self.config_path = config_path
         self._lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
-        self._stop_requested = threading.Event()
+        self._current_stop_event: Optional[threading.Event] = None
+        self._current_session_id: int = 0
 
         # Callbacks for predictor reload
         self._on_model_promoted_callbacks: List[Any] = []
+        self.last_start_error: Optional[str] = None
 
         # State storage
         self.state: Dict[str, Any] = {
@@ -77,11 +79,20 @@ class TrainingManager:
         """Register a callback function to be called when a new model is promoted to production."""
         self._on_model_promoted_callbacks.append(callback)
 
+    @property
+    def _stop_requested(self) -> threading.Event:
+        """Backward-compatibility shim for external inspections."""
+        return self._current_stop_event if self._current_stop_event is not None else threading.Event()
+
     def log(self, message: str, replace_last: bool = False):
         """Append or update a log message thread-safely."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         entry = f"[{timestamp}] {message}"
-        print(f"[TrainingManager] {entry}")
+        try:
+            print(f"[TrainingManager] {entry}")
+        except UnicodeEncodeError:
+            safe_entry = entry.encode("ascii", errors="replace").decode("ascii")
+            print(f"[TrainingManager] {safe_entry}")
         with self._lock:
             if replace_last and len(self.state["logs"]) > 0:
                 self.state["logs"][-1] = entry
@@ -136,7 +147,11 @@ class TrainingManager:
             "models_available": models_available,
         }
 
-    def sync_gathered_dataset(self, laravel_dataset_path: Optional[str] = None) -> int:
+    def sync_gathered_dataset(
+        self,
+        laravel_dataset_path: Optional[str] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> int:
         """
         Synchronize newly collected scan images from Laravel's dataset storage
         into the algorithm's data/raw/ directories.
@@ -165,10 +180,11 @@ class TrainingManager:
 
         copied_count = 0
         deleted_count = 0
+        event = stop_event or self._current_stop_event
 
         for cat_lower, target_class_name in category_map.items():
-            # Bug fix: respect cancellation during potentially slow file sync
-            if self._stop_requested.is_set():
+            # Respect cancellation during potentially slow file sync
+            if event and event.is_set():
                 self.log("⚠ Dataset sync aborted by cancellation request.")
                 return copied_count
 
@@ -180,7 +196,7 @@ class TrainingManager:
             if os.path.exists(source_folder) and os.path.isdir(source_folder):
                 valid_source_fnames = set(os.listdir(source_folder))
                 for fname in valid_source_fnames:
-                    if self._stop_requested.is_set():
+                    if event and event.is_set():
                         self.log("⚠ Dataset sync aborted by cancellation request.")
                         return copied_count
 
@@ -197,6 +213,9 @@ class TrainingManager:
             # Prune any previously synced webapp images that were deleted from webapp storage
             if os.path.exists(target_folder):
                 for target_file in os.listdir(target_folder):
+                    if event and event.is_set():
+                        self.log("⚠ Dataset sync aborted by cancellation request.")
+                        return copied_count
                     if target_file.startswith("webapp_"):
                         orig_fname = target_file[7:]  # strip 'webapp_'
                         if orig_fname not in valid_source_fnames:
@@ -214,21 +233,133 @@ class TrainingManager:
         )
         return copied_count
 
+    def sync_expansion_disease(
+        self,
+        disease_slug: str,
+        laravel_oos_path: Optional[str] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> int:
+        """
+        Synchronize images of a selected out-of-scope disease into data/raw/ for model expansion.
+        """
+        self.log(f"Syncing out-of-scope disease '{disease_slug}' into training dataset...")
+        if not laravel_oos_path:
+            laravel_oos_path = os.path.abspath(
+                os.path.join(PROJECT_ROOT, "..", "DermAssist-API", "storage", "app", "public", "out_of_scope_dataset")
+            )
+
+        if not os.path.exists(laravel_oos_path):
+            self.log(f"⚠ Out-of-scope dataset path not found: {laravel_oos_path}")
+            return 0
+
+        config = load_config(self.config_path)
+        target_raw_dir = config["data"]["raw_dir"]
+        os.makedirs(target_raw_dir, exist_ok=True)
+
+        source_folder = os.path.join(laravel_oos_path, disease_slug.lower())
+        target_folder = os.path.join(target_raw_dir, disease_slug.replace("_", " ").title())
+        os.makedirs(target_folder, exist_ok=True)
+
+        copied_count = 0
+        event = stop_event or self._current_stop_event
+        if os.path.exists(source_folder) and os.path.isdir(source_folder):
+            for fname in os.listdir(source_folder):
+                if event and event.is_set():
+                    return copied_count
+                src_file = os.path.join(source_folder, fname)
+                if os.path.isfile(src_file):
+                    dest_file = os.path.join(target_folder, f"webapp_{fname}")
+                    if not os.path.exists(dest_file):
+                        try:
+                            shutil.copy2(src_file, dest_file)
+                            copied_count += 1
+                        except Exception as e:
+                            self.log(f"Failed to copy {fname}: {e}")
+
+        self.log(f"Synced {copied_count} images for new disease '{disease_slug.title()}'.")
+        return copied_count
+
+    def _set_state(
+        self,
+        stop_event: Optional[threading.Event] = None,
+        session_id: Optional[int] = None,
+        **kwargs
+    ):
+        """Thread-safely update state unless cancellation was requested or session expired."""
+        with self._lock:
+            event = stop_event or self._current_stop_event
+            if event and event.is_set():
+                return
+            if session_id is not None and session_id != self._current_session_id:
+                return
+            self.state.update(kwargs)
+
     def start_training(
         self,
         architecture: Optional[str] = None,
         epochs: int = 5,
         sync_dataset: bool = True,
         learning_rate: Optional[float] = None,
+        expansion_disease: Optional[str] = None,
     ) -> bool:
         """
         Start the training loop in a non-blocking background thread.
+        Guarantees strictly ONE active training thread at any time.
         """
-        with self._lock:
-            if self.state["status"] in ["syncing", "training", "evaluating"]:
+        self.last_start_error = None
+
+        # Step 0: Validate dataset sufficiency for model expansion runs
+        if expansion_disease:
+            disease_slug = expansion_disease.lower().strip()
+            valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+
+            # Count in Laravel public storage
+            laravel_oos_path = os.path.abspath(
+                os.path.join(PROJECT_ROOT, "..", "DermAssist-API", "storage", "app", "public", "out_of_scope_dataset", disease_slug)
+            )
+            oos_count = 0
+            if os.path.exists(laravel_oos_path) and os.path.isdir(laravel_oos_path):
+                oos_count = len([f for f in os.listdir(laravel_oos_path) if os.path.splitext(f)[1].lower() in valid_exts])
+
+            # Count in existing raw_dir
+            config = load_config(self.config_path)
+            raw_dir = config["data"]["raw_dir"]
+            raw_disease_folder = os.path.join(raw_dir, expansion_disease.replace("_", " ").title())
+            raw_count = 0
+            if os.path.exists(raw_disease_folder) and os.path.isdir(raw_disease_folder):
+                raw_count = len([
+                    f for f in os.listdir(raw_disease_folder)
+                    if os.path.splitext(f)[1].lower() in valid_exts and not f.lower().startswith("aug_")
+                ])
+
+            available_count = max(oos_count, raw_count)
+            if available_count < 10:
+                err_msg = (
+                    f"Insufficient dataset for model expansion: At least 10 verified research images "
+                    f"are required for {expansion_disease.title()}. Currently {available_count} available."
+                )
+                self.last_start_error = err_msg
+                self.log(f"⚠ {err_msg}")
                 return False
 
-            self._stop_requested.clear()
+        # Step 1: Handle any existing running thread
+        if self._thread is not None and self._thread.is_alive():
+            # If the active thread was requested to stop, wait for it to cleanly terminate
+            if self._current_stop_event is not None and self._current_stop_event.is_set():
+                self.log("⏳ Waiting for previous training session to complete shutdown...")
+                self._thread.join(timeout=4.0)
+
+            # If still alive, strictly refuse to start a second concurrent training run
+            if self._thread.is_alive():
+                self.log("⚠ Cannot start new training: previous training session is still active.")
+                return False
+
+        with self._lock:
+            self._current_session_id += 1
+            session_id = self._current_session_id
+            session_stop_event = threading.Event()
+            self._current_stop_event = session_stop_event
+
             arch = architecture or "swin_transformer"
             self.state.update({
                 "status": "syncing" if sync_dataset else "training",
@@ -245,7 +376,11 @@ class TrainingManager:
                 "baseline_val_acc": 0.0,
                 "best_val_acc": 0.0,
                 "model_promoted": False,
-                "message": "Initializing training pipeline...",
+                "message": (
+                    f"Initializing expansion training for {expansion_disease.title()}..."
+                    if expansion_disease
+                    else "Initializing training pipeline..."
+                ),
                 "eta_seconds": 0,
                 "elapsed_seconds": 0,
                 "logs": [],
@@ -258,45 +393,61 @@ class TrainingManager:
                 "started_at": datetime.now().isoformat(),
                 "completed_at": None,
                 "start_time": time.time(),
+                "expansion_disease": expansion_disease,
             })
 
         self._thread = threading.Thread(
             target=self._run_training_worker,
-            args=(arch, epochs, sync_dataset, learning_rate),
+            args=(arch, epochs, sync_dataset, learning_rate, expansion_disease, session_stop_event, session_id),
             daemon=True,
         )
         self._thread.start()
         return True
 
-    def cancel_training(self, wait_seconds: float = 30.0) -> bool:
+    def cancel_training(self) -> bool:
         """
-        Request training cancellation safely and idempotently, and wait for the worker thread to terminate.
-
-        The method signals the stop event, then joins the background thread with a
-        generous timeout so that the status is already 'cancelled' by the time the
-        API returns — preventing the race where the client polls /train/status and
-        still sees 'training' after a successful cancel call.
+        Request training cancellation immediately and cleanly signal background workers.
+        Transitions status: active -> cancelling -> cancelled.
         """
+        active_thread = None
         with self._lock:
             current_status = self.state.get("status")
             if current_status in ["cancelling", "cancelled"]:
                 return True
             if current_status not in ["syncing", "training", "evaluating"]:
                 return False
+
+            if self._current_stop_event is not None:
+                self._current_stop_event.set()
+
+            active_thread = self._thread
             self.state["status"] = "cancelling"
-            self.state["message"] = "Stopping training..."
-            self._stop_requested.set()
+            self.state["message"] = "Stopping training pipeline..."
 
-        self.log("⚠ Cancellation requested by user...")
+        self.log("🛑 Training cancellation requested. Signaling background worker to abort...")
 
-        # Wait outside the lock so the worker thread can acquire it to write its
-        # final 'cancelled' state without deadlocking against cancel_training.
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=wait_seconds)
+        # Fast join: if thread terminates quickly (between steps/batches), immediately mark cancelled
+        if active_thread is not None and active_thread.is_alive():
+            active_thread.join(timeout=3.0)
+
+        with self._lock:
+            if active_thread is None or not active_thread.is_alive():
+                self.state["status"] = "cancelled"
+                self.state["message"] = "Training was cancelled."
+                self.state["eta_seconds"] = 0
+                self.state["completed_at"] = datetime.now().isoformat()
+                self.log("🛑 Training successfully cancelled.")
 
         return True
 
-    def _evaluate_baseline(self, model: nn.Module, val_loader, criterion, device) -> tuple:
+    def _evaluate_baseline(
+        self,
+        model: nn.Module,
+        val_loader,
+        criterion,
+        device,
+        stop_event: Optional[threading.Event] = None,
+    ) -> tuple:
         """Evaluate baseline accuracy before training begins."""
         model.eval()
         running_loss = 0.0
@@ -305,7 +456,7 @@ class TrainingManager:
 
         with torch.no_grad():
             for images, labels in val_loader:
-                if self._stop_requested.is_set():
+                if (stop_event and stop_event.is_set()) or self._stop_requested.is_set():
                     return 0.0, 0.0
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
@@ -325,9 +476,17 @@ class TrainingManager:
         epochs: int,
         sync_dataset: bool,
         learning_rate: Optional[float],
+        expansion_disease: Optional[str] = None,
+        stop_event: Optional[threading.Event] = None,
+        session_id: Optional[int] = None,
     ):
         """Worker thread executing the training loop with Validation Guard."""
+        current_stop = stop_event or self._current_stop_event or threading.Event()
         try:
+            if current_stop.is_set():
+                self._handle_cancellation(session_id)
+                return
+
             # Determine if retraining full ensemble or a single backbone
             if architecture in ["ensemble", "all", "tri_model"]:
                 arch_list = ["swin_transformer", "resnet50", "efficientnet_v2"]
@@ -337,21 +496,73 @@ class TrainingManager:
                 is_ensemble_run = False
 
             total_models = len(arch_list)
+            pipeline_name = f"EXPANSION RUN (+{expansion_disease.upper()})" if expansion_disease else ("TRI-MODEL ENSEMBLE" if is_ensemble_run else arch_list[0].upper())
             self.log("=" * 64)
             self.log("   DERMASSIST - MULTI-MODEL BENCHMARK TRAINING PIPELINE")
             self.log("=" * 64)
-            self.log(f"   Architecture Pipeline : {'TRI-MODEL ENSEMBLE' if is_ensemble_run else arch_list[0].upper()}")
+            self.log(f"   Architecture Pipeline : {pipeline_name}")
             self.log(f"   Active Models         : {', '.join([a.upper() for a in arch_list])}")
             self.log(f"   Epochs Per Backbone   : {epochs} epoch(s)")
             self.log(f"   Dataset Auto-Sync     : {'Enabled' if sync_dataset else 'Disabled'}")
             self.log("=" * 64)
 
+            # Configure target classes explicitly to guarantee zero conflict between standard retraining and expansion
+            if expansion_disease:
+                disease_title = expansion_disease.replace("_", " ").title()
+                raw_dir = load_config(self.config_path)["data"]["raw_dir"]
+                disease_dir = os.path.join(raw_dir, disease_title)
+                valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+                curr_images = (
+                    len([f for f in os.listdir(disease_dir) if os.path.splitext(f)[1].lower() in valid_exts and not f.startswith("aug_")])
+                    if os.path.exists(disease_dir)
+                    else 0
+                )
+                if curr_images < 10:
+                    abort_err = f"Aborted: Insufficient dataset for {disease_title} ({curr_images}/10 images). At least 10 verified images are required."
+                    self.log(f"❌ {abort_err}")
+                    with self._lock:
+                        if session_id is None or session_id == self._current_session_id:
+                            self.state["status"] = "failed"
+                            self.state["message"] = abort_err
+                            self.state["completed_at"] = datetime.now().isoformat()
+                    return
+
+                target_class_names = ["Acne", "Eczema", "Herpes", disease_title]
+                target_num_classes = 4
+            else:
+                target_class_names = ["Acne", "Eczema", "Herpes"]
+                target_num_classes = 3
+                # Guarantee isolation: prune non-baseline folders from data/raw for pure 3-disease retraining
+                raw_dir = load_config(self.config_path)["data"]["raw_dir"]
+                if os.path.exists(raw_dir):
+                    for folder_name in os.listdir(raw_dir):
+                        if folder_name not in target_class_names and os.path.isdir(os.path.join(raw_dir, folder_name)):
+                            shutil.rmtree(os.path.join(raw_dir, folder_name), ignore_errors=True)
+                            self.log(f"🧹 Cleaned non-baseline folder '{folder_name}' to maintain pure 3-disease training.")
+
+            if current_stop.is_set():
+                self._handle_cancellation(session_id)
+                return
+
             # Step 1: Sync dataset if requested
             if sync_dataset:
-                self.sync_gathered_dataset()
+                self.sync_gathered_dataset(stop_event=current_stop)
+                if expansion_disease:
+                    self.sync_expansion_disease(expansion_disease, stop_event=current_stop)
 
-            if self._stop_requested.is_set():
-                self._handle_cancellation()
+            # 🛡️ Dual-Safekeeping: When expanding, archive 3-disease baseline models
+            if expansion_disease:
+                backup_3class_dir = "models/production_3class_backup"
+                os.makedirs(backup_3class_dir, exist_ok=True)
+                prod_dir = "models/production"
+                if os.path.exists(prod_dir):
+                    for f in os.listdir(prod_dir):
+                        if f.endswith(".pth") and not f.endswith("_backup.pth"):
+                            shutil.copy2(os.path.join(prod_dir, f), os.path.join(backup_3class_dir, f))
+                    self.log(f"🛡️ Safekeeping: 3-Disease baseline models safely archived in {backup_3class_dir}/")
+
+            if current_stop.is_set():
+                self._handle_cancellation(session_id)
                 return
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -363,8 +574,8 @@ class TrainingManager:
             avg_val_duration: float = 3.0
 
             for arch_idx, arch in enumerate(arch_list):
-                if self._stop_requested.is_set():
-                    self._handle_cancellation()
+                if current_stop.is_set():
+                    self._handle_cancellation(session_id)
                     return
 
                 model_num = arch_idx + 1
@@ -372,28 +583,40 @@ class TrainingManager:
                 self.log(f"▶ [{model_num}/{total_models}] TRAINING BACKBONE: {arch.upper()}")
                 self.log("-" * 64)
 
-                with self._lock:
-                    self.state["status"] = "training"
-                    self.state["architecture"] = arch
-                    self.state["message"] = (
+                self._set_state(
+                    stop_event=current_stop,
+                    session_id=session_id,
+                    status="training",
+                    architecture=arch,
+                    message=(
                         f"Training Model {model_num}/{total_models} ({arch.replace('_', ' ').title()})..."
                         if is_ensemble_run
                         else f"Training {arch.replace('_', ' ').title()}..."
                     )
+                )
 
                 config = load_config(self.config_path)
                 config["advanced"]["active_architecture"] = arch
                 config["training"]["epochs"] = epochs
+                config["model"]["num_classes"] = target_num_classes
+                config["model"]["class_names"] = target_class_names
                 if learning_rate is not None:
                     config["training"]["learning_rate"] = learning_rate
 
                 # Step 2: Dataloaders
-                self.log(f"Building clinical data loaders for {arch.upper()}...")
+                self.log(f"Building clinical data loaders for {arch.upper()} with classes: {target_class_names}...")
                 train_loader, val_loader, class_names = create_dataloaders(config)
                 total_batches = len(train_loader)
 
-                with self._lock:
-                    self.state["total_batches"] = total_batches
+                self._set_state(
+                    stop_event=current_stop,
+                    session_id=session_id,
+                    total_batches=total_batches
+                )
+
+                if current_stop.is_set():
+                    self._handle_cancellation(session_id)
+                    return
 
                 # Step 3: Model Setup
                 self.log(f"Initializing {arch.upper()} architecture...")
@@ -415,6 +638,10 @@ class TrainingManager:
                     except Exception as e:
                         self.log(f"Could not load checkpoint ({e}). Training from backbone initialization.")
 
+                if current_stop.is_set():
+                    self._handle_cancellation(session_id)
+                    return
+
                 # Calculate class weights
                 from collections import Counter
                 train_labels = [
@@ -431,18 +658,24 @@ class TrainingManager:
                 # Baseline evaluation on current validation set
                 if baseline_acc == 0.0 and len(val_loader) > 0:
                     self.log(f"Evaluating baseline for {arch.upper()} on validation set...")
-                    with self._lock:
-                        self.state["status"] = "evaluating"
-                        self.state["message"] = f"Measuring baseline for {arch.replace('_', ' ').title()}..."
-                    _, baseline_acc = self._evaluate_baseline(model, val_loader, criterion, device)
-                    if self._stop_requested.is_set():
-                        self._handle_cancellation()
+                    self._set_state(
+                        stop_event=current_stop,
+                        session_id=session_id,
+                        status="evaluating",
+                        message=f"Measuring baseline for {arch.replace('_', ' ').title()}..."
+                    )
+                    _, baseline_acc = self._evaluate_baseline(model, val_loader, criterion, device, stop_event=current_stop)
+                    if current_stop.is_set():
+                        self._handle_cancellation(session_id)
                         return
                     self.log(f"Measured baseline accuracy: {baseline_acc:.2f}%")
 
-                with self._lock:
-                    self.state["baseline_val_acc"] = round(baseline_acc, 2)
-                    self.state["status"] = "training"
+                self._set_state(
+                    stop_event=current_stop,
+                    session_id=session_id,
+                    baseline_val_acc=round(baseline_acc, 2),
+                    status="training"
+                )
 
                 # Setup Optimizer & Scheduler
                 lr = learning_rate or (0.00005 if arch == "swin_transformer" else 0.0001)
@@ -456,8 +689,8 @@ class TrainingManager:
 
                 # Training Epochs
                 for epoch in range(epochs):
-                    if self._stop_requested.is_set():
-                        self._handle_cancellation()
+                    if current_stop.is_set():
+                        self._handle_cancellation(session_id)
                         return
 
                     epoch_start_time = time.time()
@@ -466,17 +699,20 @@ class TrainingManager:
                     correct = 0
                     total = 0
 
-                    with self._lock:
-                        self.state["current_epoch"] = epoch + 1
-                        self.state["message"] = (
+                    self._set_state(
+                        stop_event=current_stop,
+                        session_id=session_id,
+                        current_epoch=epoch + 1,
+                        message=(
                             f"[{model_num}/{total_models}] {arch.replace('_', ' ').title()} - Epoch {epoch + 1}/{epochs}"
                             if is_ensemble_run
                             else f"Training Epoch {epoch + 1}/{epochs}"
                         )
+                    )
 
                     for batch_idx, (images, labels) in enumerate(train_loader):
-                        if self._stop_requested.is_set():
-                            self._handle_cancellation()
+                        if current_stop.is_set():
+                            self._handle_cancellation(session_id)
                             return
 
                         batch_start_time = time.time()
@@ -494,6 +730,10 @@ class TrainingManager:
                         else:
                             smoothed_step_duration = (0.85 * smoothed_step_duration) + (0.15 * batch_duration)
 
+                        if current_stop.is_set():
+                            self._handle_cancellation(session_id)
+                            return
+
                         running_loss += loss.item() * images.size(0)
                         _, predicted = outputs.max(1)
                         total += labels.size(0)
@@ -502,6 +742,11 @@ class TrainingManager:
 
                         # Periodic progress update & live terminal bar
                         if batch_idx % 2 == 0 or batch_idx == total_batches - 1:
+                            if current_stop.is_set():
+                                self._handle_cancellation(session_id)
+                                return
+
+                            # Calculate cumulative progress across all models in ensemble
                             sub_progress = (step_count / max(total_steps, 1)) * 100.0
                             overall_progress = round(
                                 ((arch_idx * 100.0) + sub_progress) / total_models, 1
@@ -516,12 +761,15 @@ class TrainingManager:
                             step_time = smoothed_step_duration if smoothed_step_duration is not None else batch_duration
                             eta = int((remaining_steps * step_time) + (remaining_epochs * avg_val_duration))
 
-                            with self._lock:
-                                self.state["progress"] = min(overall_progress, 99.0)
-                                self.state["current_batch"] = batch_idx + 1
-                                self.state["train_loss"] = round(current_train_loss, 4)
-                                self.state["train_acc"] = round(current_train_acc, 2)
-                                self.state["eta_seconds"] = eta
+                            self._set_state(
+                                stop_event=current_stop,
+                                session_id=session_id,
+                                progress=min(overall_progress, 99.0),
+                                current_batch=batch_idx + 1,
+                                train_loss=round(current_train_loss, 4),
+                                train_acc=round(current_train_acc, 2),
+                                eta_seconds=eta
+                            )
 
                             # Generate ASCII progress bar for live terminal stream
                             pct = int((batch_idx + 1) / max(total_batches, 1) * 100)
@@ -541,6 +789,10 @@ class TrainingManager:
                             self.log(progress_log, replace_last=(batch_idx > 0 and not is_epoch_done))
 
                     # Validation Phase
+                    if current_stop.is_set():
+                        self._handle_cancellation(session_id)
+                        return
+
                     scheduler.step()
                     model.eval()
                     val_start_time = time.time()
@@ -548,16 +800,16 @@ class TrainingManager:
                     val_correct = 0
                     val_total = 0
 
-                    with self._lock:
-                        self.state["status"] = "evaluating"
-                        self.state["message"] = f"Validating {arch.replace('_', ' ').title()} (Epoch {epoch + 1}/{epochs})..."
+                    self._set_state(
+                        stop_event=current_stop,
+                        session_id=session_id,
+                        status="evaluating",
+                        message=f"Validating {arch.replace('_', ' ').title()} (Epoch {epoch + 1}/{epochs})..."
+                    )
 
                     with torch.no_grad():
                         for images, labels in val_loader:
-                            # Bug fix: check for cancellation inside the validation loop
-                            # so the thread doesn't keep running through a full val pass
-                            # after the user has already pressed cancel.
-                            if self._stop_requested.is_set():
+                            if current_stop.is_set():
                                 break
 
                             images, labels = images.to(device), labels.to(device)
@@ -568,9 +820,8 @@ class TrainingManager:
                             val_total += labels.size(0)
                             val_correct += predicted.eq(labels).sum().item()
 
-                    # Propagate cancellation after breaking out of the val loop
-                    if self._stop_requested.is_set():
-                        self._handle_cancellation()
+                    if current_stop.is_set():
+                        self._handle_cancellation(session_id)
                         return
 
                     val_duration = max(time.time() - val_start_time, 0.5)
@@ -603,16 +854,21 @@ class TrainingManager:
                     )
 
                     with self._lock:
-                        self.state["status"] = "training"
-                        self.state["val_loss"] = round(epoch_val_loss, 4)
-                        self.state["val_acc"] = round(epoch_val_acc, 2)
-                        self.state["best_val_acc"] = round(best_val_acc, 2)
-                        self.state["history"]["train_loss"].append(round(epoch_train_loss, 4))
-                        self.state["history"]["train_acc"].append(round(epoch_train_acc, 2))
-                        self.state["history"]["val_loss"].append(round(epoch_val_loss, 4))
-                        self.state["history"]["val_acc"].append(round(epoch_val_acc, 2))
+                        if not current_stop.is_set() and (session_id is None or session_id == self._current_session_id):
+                            self.state["status"] = "training"
+                            self.state["val_loss"] = round(epoch_val_loss, 4)
+                            self.state["val_acc"] = round(epoch_val_acc, 2)
+                            self.state["best_val_acc"] = round(best_val_acc, 2)
+                            self.state["history"]["train_loss"].append(round(epoch_train_loss, 4))
+                            self.state["history"]["train_acc"].append(round(epoch_train_acc, 2))
+                            self.state["history"]["val_loss"].append(round(epoch_val_loss, 4))
+                            self.state["history"]["val_acc"].append(round(epoch_val_acc, 2))
 
                 # Step 4: VALIDATION GUARD CHECK FOR THIS MODEL
+                if current_stop.is_set():
+                    self._handle_cancellation(session_id)
+                    return
+
                 self.log(f"--- VALIDATION GUARD: {arch.upper()} ---")
                 self.log(f"Baseline: {baseline_acc:.2f}% | Best Achieved: {best_val_acc:.2f}%")
 
@@ -625,12 +881,22 @@ class TrainingManager:
                     if os.path.exists(target_prod_path):
                         shutil.copy2(target_prod_path, backup_prod_path)
                     torch.save(new_best_model_weights, target_prod_path)
+                    if expansion_disease:
+                        checkpoints_4class_dir = "models/checkpoints_4class"
+                        os.makedirs(checkpoints_4class_dir, exist_ok=True)
+                        ckpt_4class_path = os.path.join(checkpoints_4class_dir, f"best_model_{arch}_4class.pth")
+                        torch.save(new_best_model_weights, ckpt_4class_path)
+                        self.log(f"💾 Safe-keeping Checkpoint: Expanded model saved -> {ckpt_4class_path}")
                     self.log(f"🚀 Deployed to production -> {target_prod_path}")
                     promoted_models.append(arch)
                     results_summary.append(f"{arch.upper()}: {best_val_acc:.2f}% (Promoted)")
                 else:
                     self.log(f"🛡 GUARD PRESERVED: {arch.upper()} did not beat baseline ({baseline_acc:.2f}%).")
                     results_summary.append(f"{arch.upper()}: Baseline {baseline_acc:.2f}% kept")
+
+            if current_stop.is_set():
+                self._handle_cancellation(session_id)
+                return
 
             # Final Step: Hot-reload predictor if any models promoted
             if promoted_models:
@@ -643,38 +909,51 @@ class TrainingManager:
                         self.log(f"⚠ Predictor reload callback failed: {ex}")
 
             with self._lock:
-                self.state["status"] = "completed"
-                self.state["progress"] = 100.0
-                self.state["eta_seconds"] = 0
-                self.state["model_promoted"] = len(promoted_models) > 0
-                self.state["completed_at"] = datetime.now().isoformat()
-                self.state["architecture"] = "ensemble" if is_ensemble_run else arch_list[0]
-                summary_str = " | ".join(results_summary)
-                self.state["message"] = (
-                    f"Ensemble training complete! {len(promoted_models)}/{total_models} models improved. [{summary_str}]"
-                    if is_ensemble_run
-                    else f"Training complete! {results_summary[0]}"
-                )
+                if not current_stop.is_set() and (session_id is None or session_id == self._current_session_id):
+                    self.state["status"] = "completed"
+                    self.state["progress"] = 100.0
+                    self.state["eta_seconds"] = 0
+                    self.state["model_promoted"] = len(promoted_models) > 0
+                    self.state["completed_at"] = datetime.now().isoformat()
+                    self.state["architecture"] = "ensemble" if is_ensemble_run else arch_list[0]
+                    summary_str = " | ".join(results_summary)
+                    self.state["message"] = (
+                        f"Ensemble training complete! {len(promoted_models)}/{total_models} models improved. [{summary_str}]"
+                        if is_ensemble_run
+                        else f"Training complete! {results_summary[0]}"
+                    )
 
         except Exception as e:
+            if current_stop.is_set():
+                self._handle_cancellation(session_id)
+                return
+
             import traceback
             err_msg = traceback.format_exc()
             self.log(f"❌ Training failed with exception: {e}")
             print(err_msg)
             with self._lock:
-                self.state["status"] = "failed"
-                self.state["message"] = f"Training failed: {str(e)}"
+                if session_id is None or session_id == self._current_session_id:
+                    self.state["status"] = "failed"
+                    self.state["message"] = f"Training failed: {str(e)}"
+                    self.state["eta_seconds"] = 0
+                    self.state["completed_at"] = datetime.now().isoformat()
+
+    def _handle_cancellation(self, session_id: Optional[int] = None):
+        """Clean up when cancellation is requested."""
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        with self._lock:
+            if session_id is None or session_id == self._current_session_id:
+                self.state["status"] = "cancelled"
+                self.state["message"] = "Training was cancelled."
                 self.state["eta_seconds"] = 0
                 self.state["completed_at"] = datetime.now().isoformat()
-
-    def _handle_cancellation(self):
-        """Clean up when cancellation is requested."""
-        self.log("🛑 Training successfully cancelled by user.")
-        with self._lock:
-            self.state["status"] = "cancelled"
-            self.state["message"] = "Training was cancelled."
-            self.state["eta_seconds"] = 0
-            self.state["completed_at"] = datetime.now().isoformat()
+        self.log("🛑 Training safely aborted.")
 
 
 # Global Singleton
