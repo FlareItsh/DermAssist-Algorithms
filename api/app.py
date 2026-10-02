@@ -37,6 +37,7 @@ class StartTrainingRequest(BaseModel):
     epochs: Optional[int] = 5
     sync_dataset: Optional[bool] = True
     learning_rate: Optional[float] = None
+    expansion_disease: Optional[str] = None
 
 class TrainingStatusResponse(BaseModel):
     status: str
@@ -86,6 +87,7 @@ class PredictionResponse(BaseModel):
     image_quality: Optional[ImageQuality] = None
     is_inconclusive: bool = False
     clinical_feedback: Optional[str] = None
+    out_of_scope_category: Optional[str] = None
 
 class ValidationResponse(BaseModel):
     is_skin: bool
@@ -202,6 +204,16 @@ except Exception as _e:
 # ---- Image quality assessor (observational only — never alters images) ----
 quality_assessor = ImageQualityAssessor()
 
+import logging
+
+class EndpointFilter(logging.Filter):
+    """Filter out routine high-frequency status polling from console logs."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "/train/status" not in msg and "/model/retrain/status" not in msg
+
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
+
 # ============================================================
 # Application Setup
 # ============================================================
@@ -210,6 +222,10 @@ app = FastAPI(
     title="DermAssist AI API",
     version="1.0.0",
 )
+
+@app.on_event("startup")
+def setup_access_log_filters():
+    logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
 # CORS
 app.add_middleware(
@@ -329,6 +345,7 @@ async def predict(file: UploadFile = File(...)):
                 os.remove(temp_path)
                 image_quality = ImageQuality(**quality_result.to_dict()) if quality_result else None
                 unsupported_conf = validation.get("category_scores", {}).get("unsupported_condition", 0.90)
+                out_of_scope_cat = validation.get("out_of_scope_category")
                 return PredictionResponse(
                     label="Inconclusive",
                     confidence=round(unsupported_conf, 4),
@@ -339,6 +356,7 @@ async def predict(file: UploadFile = File(...)):
                     image_quality=image_quality,
                     is_inconclusive=True,
                     clinical_feedback="This condition appears to be outside our 3 primary focus areas (Acne, Eczema, Herpes). It may represent an unsupported skin condition (such as Psoriasis, Ringworm, or other lesion). Please consult a licensed dermatologist for comprehensive clinical evaluation.",
+                    out_of_scope_category=out_of_scope_cat,
                 )
 
         # ---- Image quality assessment (metadata only — image unchanged) ----
@@ -405,32 +423,37 @@ async def predict(file: UploadFile = File(...)):
 # ============================================================
 
 @app.post("/train/start", response_model=dict)
-async def start_training(request: StartTrainingRequest):
+def start_training(request: StartTrainingRequest):
     """Trigger asynchronous background model retraining."""
     success = training_manager.start_training(
         architecture=request.architecture,
         epochs=request.epochs or 5,
         sync_dataset=request.sync_dataset if request.sync_dataset is not None else True,
         learning_rate=request.learning_rate,
+        expansion_disease=request.expansion_disease,
     )
     if not success:
-        raise HTTPException(status_code=409, detail="A training session is already in progress.")
+        error_msg = getattr(training_manager, "last_start_error", None) or "A training session is already in progress."
+        status_code = 422 if "Insufficient" in error_msg else 409
+        raise HTTPException(status_code=status_code, detail=error_msg)
 
+    desc = f"Expansion training for {request.expansion_disease.title()}" if request.expansion_disease else f"Retraining started for {request.architecture or 'ensemble'}"
     return {
-        "message": f"Retraining started for {request.architecture or 'ensemble'}",
+        "message": desc,
         "status": "started",
         "epochs": request.epochs or 5,
+        "expansion_disease": request.expansion_disease,
     }
 
 
 @app.get("/train/status", response_model=TrainingStatusResponse)
-async def get_training_status():
+def get_training_status():
     """Get live training status, progress percentage, loss, and logs."""
     return TrainingStatusResponse(**training_manager.get_status())
 
 
 @app.post("/train/cancel", response_model=dict)
-async def cancel_training():
+def cancel_training():
     """Cancel current training session safely."""
     success = training_manager.cancel_training()
     if not success:
@@ -439,20 +462,20 @@ async def cancel_training():
 
 
 @app.get("/model/stats", response_model=dict)
-async def get_model_stats():
+def get_model_stats():
     """Return dataset statistics, baseline count, and model configuration."""
     return training_manager.get_dataset_stats()
 
 
 @app.post("/dataset/sync", response_model=dict)
-async def sync_dataset():
+def sync_dataset():
     """Manually synchronize dataset images from webapp storage."""
     count = training_manager.sync_gathered_dataset()
     return {"message": f"Successfully synced {count} images from webapp storage.", "copied_count": count}
 
 
 @app.post("/model/reload", response_model=dict)
-async def trigger_reload():
+def trigger_reload():
     """Hot-reload model predictor weights."""
     success = reload_predictor()
     if not success:

@@ -12,6 +12,7 @@ Supports:
 """
 
 import os
+import sys
 import yaml
 from pathlib import Path
 from typing import Tuple, Optional, Dict
@@ -283,7 +284,12 @@ def create_dataloaders(
 
     class_names = config["model"].get("class_names", None)
     batch_size = config["training"]["batch_size"]
-    num_workers = config["data"]["num_workers"]
+    num_workers = config["data"].get("num_workers", 0)
+    if sys.platform == "win32":
+        # Multi-worker DataLoader on Windows spawns background python processes
+        # via multiprocessing.spawn that block during thread cancellation, re-run eager loading,
+        # and duplicate memory. Single-worker in-thread loading guarantees instant cancellation.
+        num_workers = 0
     train_split = config["data"]["train_split"]
 
     # Build transforms
@@ -374,12 +380,13 @@ def create_dataloaders(
     val_dataset = TransformSubset(val_subset, val_transform)
 
     # Create DataLoaders
+    use_pin_memory = torch.cuda.is_available()
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         drop_last=True,
     )
 
@@ -388,7 +395,7 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
     )
 
     print(f"[DataLoader] Train: {train_size} samples | Val: {val_size} samples")
