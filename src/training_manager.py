@@ -669,6 +669,7 @@ class TrainingManager:
                 optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
                 scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
+                session_best_val_acc = 0.0
                 best_val_acc = baseline_acc
                 new_best_model_weights = None
                 total_steps = epochs * total_batches
@@ -790,8 +791,12 @@ class TrainingManager:
                     epoch_val_loss = val_loss_sum / max(val_total, 1)
                     epoch_val_acc = 100.0 * val_correct / max(val_total, 1)
 
-                    is_best = epoch_val_acc > best_val_acc
-                    if is_best:
+                    if epoch_val_acc > session_best_val_acc:
+                        session_best_val_acc = epoch_val_acc
+
+                    is_beat_baseline = epoch_val_acc >= baseline_acc
+                    is_new_best = epoch_val_acc > best_val_acc
+                    if is_beat_baseline and is_new_best:
                         best_val_acc = epoch_val_acc
                         new_best_model_weights = {
                             "epoch": epoch,
@@ -808,7 +813,7 @@ class TrainingManager:
                         f"[{arch.upper()}] Epoch {epoch + 1}/{epochs} ({epoch_duration}s) | "
                         f"Train Loss: {epoch_train_loss:.4f} Acc: {epoch_train_acc:.2f}% | "
                         f"Val Loss: {epoch_val_loss:.4f} Acc: {epoch_val_acc:.2f}%"
-                        + (" ⭐ (New Best)" if is_best else "")
+                        + (" ⭐ (Beat Baseline)" if is_beat_baseline else "")
                     )
 
                     with self._lock:
@@ -816,7 +821,7 @@ class TrainingManager:
                             self.state["status"] = "training"
                             self.state["val_loss"] = round(epoch_val_loss, 4)
                             self.state["val_acc"] = round(epoch_val_acc, 2)
-                            self.state["best_val_acc"] = round(best_val_acc, 2)
+                            self.state["best_val_acc"] = round(max(session_best_val_acc, baseline_acc), 2)
                             self.state["history"]["train_loss"].append(round(epoch_train_loss, 4))
                             self.state["history"]["train_acc"].append(round(epoch_train_acc, 2))
                             self.state["history"]["val_loss"].append(round(epoch_val_loss, 4))
@@ -828,14 +833,14 @@ class TrainingManager:
                     return
 
                 self.log(f"--- VALIDATION GUARD: {arch.upper()} ---")
-                self.log(f"Baseline: {baseline_acc:.2f}% | Best Achieved: {best_val_acc:.2f}%")
+                self.log(f"Baseline: {baseline_acc:.2f}% | Session Best: {session_best_val_acc:.2f}%")
 
                 target_prod_path = os.path.join("models/production", f"best_model_{arch}.pth")
                 backup_prod_path = os.path.join("models/production", f"best_model_{arch}_backup.pth")
                 os.makedirs("models/production", exist_ok=True)
 
-                if new_best_model_weights is not None and best_val_acc >= baseline_acc:
-                    self.log(f"✅ PASSED GUARD: {arch.upper()} improved ({baseline_acc:.2f}% -> {best_val_acc:.2f}%).")
+                if new_best_model_weights is not None and session_best_val_acc >= baseline_acc:
+                    self.log(f"✅ PASSED GUARD: {arch.upper()} improved ({baseline_acc:.2f}% -> {session_best_val_acc:.2f}%).")
                     if os.path.exists(target_prod_path):
                         shutil.copy2(target_prod_path, backup_prod_path)
                     torch.save(new_best_model_weights, target_prod_path)
@@ -847,10 +852,10 @@ class TrainingManager:
                         self.log(f"💾 Safe-keeping Checkpoint: Expanded model saved -> {ckpt_4class_path}")
                     self.log(f"🚀 Deployed to production -> {target_prod_path}")
                     promoted_models.append(arch)
-                    results_summary.append(f"{arch.upper()}: {best_val_acc:.2f}% (Promoted)")
+                    results_summary.append(f"{arch.upper()}: {session_best_val_acc:.2f}% (Promoted)")
                 else:
-                    self.log(f"🛡 GUARD PRESERVED: {arch.upper()} did not beat baseline ({baseline_acc:.2f}%).")
-                    results_summary.append(f"{arch.upper()}: Baseline {baseline_acc:.2f}% kept")
+                    self.log(f"🛡 GUARD PRESERVED: {arch.upper()} session best ({session_best_val_acc:.2f}%) did not beat baseline ({baseline_acc:.2f}%).")
+                    results_summary.append(f"{arch.upper()}: Baseline {baseline_acc:.2f}% kept (Session: {session_best_val_acc:.2f}%)")
 
             if current_stop.is_set():
                 self._handle_cancellation(session_id)
