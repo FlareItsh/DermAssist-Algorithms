@@ -38,11 +38,16 @@ class StartTrainingRequest(BaseModel):
     sync_dataset: Optional[bool] = True
     learning_rate: Optional[float] = None
     expansion_disease: Optional[str] = None
+    training_mode: Optional[str] = "quick"
+    fresh_start: Optional[bool] = False
+    active_image_files: Optional[List[str]] = None
 
 class TrainingStatusResponse(BaseModel):
     status: str
     progress: float
     architecture: str
+    training_mode: Optional[str] = "quick"
+    fresh_start: Optional[bool] = False
     current_epoch: int
     total_epochs: int
     current_batch: int
@@ -432,16 +437,23 @@ def start_training(request: StartTrainingRequest):
         sync_dataset=request.sync_dataset if request.sync_dataset is not None else True,
         learning_rate=request.learning_rate,
         expansion_disease=request.expansion_disease,
+        training_mode=request.training_mode or "quick",
+        fresh_start=request.fresh_start or False,
+        active_image_files=request.active_image_files,
     )
     if not success:
         error_msg = getattr(training_manager, "last_start_error", None) or "A training session is already in progress."
         status_code = 422 if "Insufficient" in error_msg else 409
         raise HTTPException(status_code=status_code, detail=error_msg)
 
-    desc = f"Expansion training for {request.expansion_disease.title()}" if request.expansion_disease else f"Retraining started for {request.architecture or 'ensemble'}"
+    mode_label = "⚡ Rapid Quick-Tune" if (request.training_mode or "quick") == "quick" else "🔄 Full Retrain"
+    fresh_label = " (Fresh Start)" if request.fresh_start else ""
+    desc = f"Expansion training for {request.expansion_disease.title()}" if request.expansion_disease else f"{mode_label}{fresh_label} started for {request.architecture or 'ensemble'}"
     return {
         "message": desc,
         "status": "started",
+        "training_mode": request.training_mode or "quick",
+        "fresh_start": request.fresh_start or False,
         "epochs": request.epochs or 5,
         "expansion_disease": request.expansion_disease,
     }

@@ -50,6 +50,8 @@ class TrainingManager:
             "status": "idle",  # idle, syncing, training, evaluating, completed, failed, cancelled
             "progress": 0.0,
             "architecture": "swin_transformer",
+            "training_mode": "quick",
+            "fresh_start": False,
             "current_epoch": 0,
             "total_epochs": 0,
             "current_batch": 0,
@@ -301,6 +303,9 @@ class TrainingManager:
         sync_dataset: bool = True,
         learning_rate: Optional[float] = None,
         expansion_disease: Optional[str] = None,
+        training_mode: str = "quick",
+        fresh_start: bool = False,
+        active_image_files: Optional[List[str]] = None,
     ) -> bool:
         """
         Start the training loop in a non-blocking background thread.
@@ -365,6 +370,8 @@ class TrainingManager:
                 "status": "syncing" if sync_dataset else "training",
                 "progress": 0.0,
                 "architecture": arch,
+                "training_mode": training_mode,
+                "fresh_start": fresh_start,
                 "current_epoch": 0,
                 "total_epochs": epochs,
                 "current_batch": 0,
@@ -379,7 +386,11 @@ class TrainingManager:
                 "message": (
                     f"Initializing expansion training for {expansion_disease.title()}..."
                     if expansion_disease
-                    else "Initializing training pipeline..."
+                    else (
+                        "Initializing rapid incremental tuning..."
+                        if training_mode == "quick"
+                        else "Initializing training pipeline..."
+                    )
                 ),
                 "eta_seconds": 0,
                 "elapsed_seconds": 0,
@@ -398,7 +409,7 @@ class TrainingManager:
 
         self._thread = threading.Thread(
             target=self._run_training_worker,
-            args=(arch, epochs, sync_dataset, learning_rate, expansion_disease, session_stop_event, session_id),
+            args=(arch, epochs, sync_dataset, learning_rate, expansion_disease, session_stop_event, session_id, training_mode, fresh_start, active_image_files),
             daemon=True,
         )
         self._thread.start()
@@ -479,6 +490,9 @@ class TrainingManager:
         expansion_disease: Optional[str] = None,
         stop_event: Optional[threading.Event] = None,
         session_id: Optional[int] = None,
+        training_mode: str = "quick",
+        fresh_start: bool = False,
+        active_image_files: Optional[List[str]] = None,
     ):
         """Worker thread executing the training loop with Validation Guard."""
         current_stop = stop_event or self._current_stop_event or threading.Event()
@@ -487,23 +501,46 @@ class TrainingManager:
                 self._handle_cancellation(session_id)
                 return
 
-            # Determine if retraining full ensemble or a single backbone
-            if architecture in ["ensemble", "all", "tri_model"]:
-                arch_list = ["swin_transformer", "resnet50", "efficientnet_v2"]
-                is_ensemble_run = True
+            # Determine architectures to train
+            if training_mode == "quick":
+                # Quick mode: fine-tune active production backbone (Swin-T)
+                if architecture in ["ensemble", "all", "tri_model"] or not architecture:
+                    active_arch = load_config(self.config_path)["advanced"].get("active_architecture", "swin_transformer")
+                    arch_list = [active_arch]
+                    is_ensemble_run = False
+                else:
+                    arch_list = [architecture]
+                    is_ensemble_run = False
             else:
-                arch_list = [architecture]
-                is_ensemble_run = False
+                # Full mode: retrain all 3 backbones if ensemble requested
+                if architecture in ["ensemble", "all", "tri_model"]:
+                    arch_list = ["swin_transformer", "resnet50", "efficientnet_v2"]
+                    is_ensemble_run = True
+                else:
+                    arch_list = [architecture]
+                    is_ensemble_run = False
 
             total_models = len(arch_list)
-            pipeline_name = f"EXPANSION RUN (+{expansion_disease.upper()})" if expansion_disease else ("TRI-MODEL ENSEMBLE" if is_ensemble_run else arch_list[0].upper())
+            pipeline_name = (
+                f"EXPANSION RUN (+{expansion_disease.upper()})"
+                if expansion_disease
+                else (
+                    f"⚡ RAPID QUICK-TUNE ({arch_list[0].upper()})"
+                    if training_mode == "quick"
+                    else ("TRI-MODEL ENSEMBLE" if is_ensemble_run else arch_list[0].upper())
+                )
+            )
             self.log("=" * 64)
             self.log("   DERMASSIST - MULTI-MODEL BENCHMARK TRAINING PIPELINE")
             self.log("=" * 64)
             self.log(f"   Architecture Pipeline : {pipeline_name}")
+            self.log(f"   Training Mode         : {'⚡ QUICK INCREMENTAL (<30s)' if training_mode == 'quick' else '🔄 FULL BENCHMARK RETRAIN'}")
+            self.log(f"   Checkpoint Strategy   : {'🌱 FRESH START (No Checkpoints)' if fresh_start else '📦 RESUME / FINE-TUNE'}")
             self.log(f"   Active Models         : {', '.join([a.upper() for a in arch_list])}")
             self.log(f"   Epochs Per Backbone   : {epochs} epoch(s)")
             self.log(f"   Dataset Auto-Sync     : {'Enabled' if sync_dataset else 'Disabled'}")
+            if active_image_files:
+                self.log(f"   Active Image Scope    : {len(active_image_files)} custom webapp scan(s) selected")
             self.log("=" * 64)
 
             # Configure target classes explicitly to guarantee zero conflict between standard retraining and expansion
@@ -550,7 +587,17 @@ class TrainingManager:
                 if expansion_disease:
                     self.sync_expansion_disease(expansion_disease, stop_event=current_stop)
 
-            # 🛡️ Dual-Safekeeping: When expanding, archive 3-disease baseline models
+            # 🛡️ Dual-Safekeeping: Archive baseline models if fresh_start or expanding
+            if fresh_start:
+                backup_fresh_dir = "models/production_checkpoints_backup"
+                os.makedirs(backup_fresh_dir, exist_ok=True)
+                prod_dir = "models/production"
+                if os.path.exists(prod_dir):
+                    for f in os.listdir(prod_dir):
+                        if f.endswith(".pth") and not f.endswith("_backup.pth"):
+                            shutil.copy2(os.path.join(prod_dir, f), os.path.join(backup_fresh_dir, f))
+                    self.log(f"🛡️ Safekeeping: Production checkpoints safely archived in {backup_fresh_dir}/ before fresh training.")
+
             if expansion_disease:
                 backup_3class_dir = "models/production_3class_backup"
                 os.makedirs(backup_3class_dir, exist_ok=True)
@@ -604,8 +651,13 @@ class TrainingManager:
                     config["training"]["learning_rate"] = learning_rate
 
                 # Step 2: Dataloaders
-                self.log(f"Building clinical data loaders for {arch.upper()} with classes: {target_class_names}...")
-                train_loader, val_loader, class_names = create_dataloaders(config)
+                self.log(f"Building clinical data loaders for {arch.upper()} with classes: {target_class_names} (mode={training_mode})...")
+                train_loader, val_loader, class_names = create_dataloaders(
+                    config,
+                    mode=training_mode,
+                    exemplar_limit=30,
+                    active_image_files=active_image_files,
+                )
                 total_batches = len(train_loader)
 
                 self._set_state(
@@ -627,7 +679,7 @@ class TrainingManager:
                     prod_model_path = os.path.join("models/production", "best_model.pth")
 
                 baseline_acc = 0.0
-                if os.path.exists(prod_model_path):
+                if not fresh_start and os.path.exists(prod_model_path):
                     try:
                         self.log(f"Loading existing weights from: {prod_model_path}")
                         ckpt = torch.load(prod_model_path, map_location=device)
@@ -637,10 +689,17 @@ class TrainingManager:
                         self.log(f"Prior checkpoint validation accuracy: {baseline_acc:.2f}%")
                     except Exception as e:
                         self.log(f"Could not load checkpoint ({e}). Training from backbone initialization.")
+                elif fresh_start:
+                    self.log(f"🌱 FRESH START: Existing checkpoints bypassed for {arch.upper()}. Initializing directly from ImageNet base weights.")
 
                 if current_stop.is_set():
                     self._handle_cancellation(session_id)
                     return
+
+                # Freeze backbone in quick mode to compute gradients only for classifier head
+                if training_mode == "quick":
+                    model._freeze_backbone()
+                    self.log(f"🧊 Frozen {arch.upper()} feature backbone: Training only 512-dim classification head.")
 
                 # Calculate class weights
                 from collections import Counter
@@ -656,7 +715,8 @@ class TrainingManager:
                 criterion = nn.CrossEntropyLoss(weight=class_weights)
 
                 # Baseline evaluation on current validation set
-                if baseline_acc == 0.0 and len(val_loader) > 0:
+                # In quick mode, always measure baseline directly on this validation loader for fair comparison
+                if (training_mode == "quick" or baseline_acc == 0.0) and len(val_loader) > 0:
                     self.log(f"Evaluating baseline for {arch.upper()} on validation set...")
                     self._set_state(
                         stop_event=current_stop,
@@ -678,8 +738,10 @@ class TrainingManager:
                 )
 
                 # Setup Optimizer & Scheduler
-                lr = learning_rate or (0.00005 if arch == "swin_transformer" else 0.0001)
-                optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                default_lr = 0.001 if training_mode == "quick" else (0.00005 if arch == "swin_transformer" else 0.0001)
+                lr = learning_rate or default_lr
+                optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
                 scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
                 best_val_acc = baseline_acc
