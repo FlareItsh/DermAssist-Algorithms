@@ -1017,6 +1017,62 @@ class TrainingManager:
                 self.state["completed_at"] = datetime.now().isoformat()
         self.log("🛑 Training safely aborted.")
 
+    def rollback_model(self, architecture: str = "ensemble") -> Dict[str, Any]:
+        """
+        Roll back active production weights to the previous backup checkpoint.
+        """
+        with self._lock:
+            if self.state["status"] in ["training", "syncing", "evaluating"]:
+                return {
+                    "success": False,
+                    "message": "Cannot rollback weights while model retraining is actively in progress.",
+                }
+
+        arch_list = ["resnet50", "efficientnet_v2", "swin_transformer"] if architecture == "ensemble" else [architecture]
+        restored = []
+        errors = []
+
+        for arch in arch_list:
+            target_prod_path = os.path.join("models/production", f"best_model_{arch}.pth")
+            backup_prod_path = os.path.join("models/production", f"best_model_{arch}_backup.pth")
+
+            if not os.path.exists(backup_prod_path):
+                # Check legacy backup path
+                legacy_backup = os.path.join("models/production", "best_model_backup.pth")
+                if os.path.exists(legacy_backup) and arch == "resnet50":
+                    backup_prod_path = legacy_backup
+                else:
+                    errors.append(f"No backup checkpoint found for {arch.upper()}")
+                    continue
+
+            try:
+                shutil.copy2(backup_prod_path, target_prod_path)
+                restored.append(arch)
+                self.log(f"⏪ ROLLBACK: Restored {arch.upper()} from {backup_prod_path} -> {target_prod_path}")
+            except Exception as e:
+                errors.append(f"Failed to restore {arch.upper()}: {str(e)}")
+
+        if restored:
+            # Trigger hot-reload of active predictor
+            for cb in self._on_model_promoted_callbacks:
+                try:
+                    cb()
+                except Exception as ex:
+                    self.log(f"⚠ Predictor reload callback failed during rollback: {ex}")
+
+            return {
+                "success": True,
+                "restored_architectures": restored,
+                "message": f"Successfully rolled back model weights for: {', '.join(restored)}.",
+                "errors": errors if errors else None,
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Rollback failed: {'; '.join(errors) if errors else 'No backups available'}.",
+                "errors": errors,
+            }
+
 
 # Global Singleton
 training_manager = TrainingManager()

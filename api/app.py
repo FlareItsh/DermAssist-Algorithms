@@ -28,6 +28,9 @@ from src.skin_validator import SkinValidator
 from src.image_quality import ImageQualityAssessor
 from src.training_manager import training_manager
 
+# Dynamic hardware acceleration
+GLOBAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 # ============================================================
 # Schemas
 # ============================================================
@@ -135,7 +138,7 @@ def init_predictor_sync():
         ensemble_enabled = config["inference"].get("ensemble_enabled", False)
         
         if ensemble_enabled:
-            print(f"[API] ⏳ LOADING ENSEMBLE MODEL")
+            print(f"[API] ⏳ LOADING ENSEMBLE MODEL (Device: {GLOBAL_DEVICE.upper()})")
             model_paths_and_archs = [
                 ("models/production/best_model_resnet50.pth", "resnet50"),
                 ("models/production/best_model_efficientnet_v2.pth", "efficientnet_v2"),
@@ -144,7 +147,7 @@ def init_predictor_sync():
             predictor = EnsemblePredictor(
                 model_paths_and_archs=model_paths_and_archs,
                 config=config,
-                device="cpu",
+                device=GLOBAL_DEVICE,
             )
         else:
             # Check if model exists
@@ -156,12 +159,12 @@ def init_predictor_sync():
                     print(f"[API] ⚠ WARNING: No model found at {model_path}. Predict endpoint will be disabled.")
                     return None
 
-            print(f"[API] ⏳ LOADING MODEL: {active_arch.upper()} from {model_path}")
+            print(f"[API] ⏳ LOADING MODEL: {active_arch.upper()} from {model_path} (Device: {GLOBAL_DEVICE.upper()})")
             
             predictor = SkinLesionPredictor(
                 model_path=model_path,
                 config=config,
-                device="cpu", 
+                device=GLOBAL_DEVICE, 
                 architecture=active_arch
             )
         
@@ -302,7 +305,7 @@ async def predict(file: UploadFile = File(...)):
                     label="None",
                     confidence=1.0,
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type="non_skin",
                     image_quality=image_quality,
@@ -319,7 +322,7 @@ async def predict(file: UploadFile = File(...)):
                     label="None",
                     confidence=1.0,
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type="full_body_portrait",
                     image_quality=image_quality,
@@ -336,7 +339,7 @@ async def predict(file: UploadFile = File(...)):
                     label="Clear",
                     confidence=0.98,
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type=image_type,
                     image_quality=image_quality,
@@ -355,7 +358,7 @@ async def predict(file: UploadFile = File(...)):
                     label="Inconclusive",
                     confidence=round(unsupported_conf, 4),
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type=image_type,
                     image_quality=image_quality,
@@ -497,6 +500,19 @@ def trigger_reload():
     if not success:
         raise HTTPException(status_code=500, detail="Failed to reload model predictor.")
     return {"message": "Model predictor reloaded successfully.", "status": "ready"}
+
+
+class RollbackRequest(BaseModel):
+    architecture: Optional[str] = "ensemble"
+
+
+@app.post("/model/rollback", response_model=dict)
+def rollback_model_endpoint(request: RollbackRequest = RollbackRequest()):
+    """Roll back active model weights to previous backup checkpoint."""
+    res = training_manager.rollback_model(architecture=request.architecture or "ensemble")
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
 
 
 if __name__ == "__main__":
