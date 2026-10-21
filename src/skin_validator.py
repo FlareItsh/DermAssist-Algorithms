@@ -85,39 +85,62 @@ class SkinValidator:
         # Category-specific prompt suites
         # Tier A: Target Conditions (Acne, Eczema, Herpes) — must describe genuine active inflammatory pathology
         self._lesion_prompts: list[str] = [
+            # Acne
             "a clinical close-up macro photo of inflamed acne pimples, red pustules, whiteheads, blackheads, or acne zits",
             "a photo of inflammatory acne vulgaris breakout with red papules, pustules, or cystic lesions",
+            "a close-up photo of facial acne, comedones, or acne breakouts on face or chin",
+            # Eczema (Atopic, Dyshidrotic, Flexural, Lichenified, Periorbital)
             "a close-up photo of hand eczema, finger dermatitis, cracked red scaly skin on knuckles or fingers",
             "a close-up photo of palm eczema, dyshidrotic eczema, pompholyx, red inflamed itchy skin on palm of hand",
-            "a close-up photo of atopic eczema, flexural eczema rash, dry itchy red patch on arm, forearm, or body",
-            "a close-up photo of atopic dermatitis, allergic contact dermatitis, or dry flaking itchy eczema skin",
+            "a close-up photo of atopic eczema, flexural dermatitis with lichenification, excoriations, or dry scaly eczema in elbow or knee creases",
+            "a photo of atopic dermatitis rash, eczema patches with fine flaking, itching, and excoriations",
+            "a close-up photo of facial eczema, eyelid dermatitis, periorbital dermatitis, dry flaking scaly skin on eyelid or cheek",
+            "a photo of skin desquamation, peeling skin, exfoliative dermatitis, or shedding dry epidermal flakes",
+            # Herpes Simplex (Oral & Genital HSV-1 / HSV-2)
             "a close-up photo of herpes simplex cold sores on lips, fever blisters, or clustered fluid-filled vesicles",
             "a close-up photo of herpes sores, cutaneous herpes, or oral/genital vesicles on skin",
+            "a close-up photo of genital herpes, painful shallow ulcers, erosions, or clustered red herpes sores on genital or groin skin",
+            "a photo of herpes simplex virus infection, herpes lesions, vesicles, or mucosal erosions",
+            "a photo of herpes simplex, clustered fluid vesicles on inflamed skin",
         ]
 
         # Tier B: Out-of-Scope / Unsupported Conditions — non-target diseases
         # Each prompt maps to a concrete disease label via self._unsupported_prompt_labels
         self._unsupported_prompts: list[str] = [
-            "a photo of psoriasis with thick red annular plaques, circular patches, or silvery scales on chest or torso",
-            "a photo of plaque psoriasis, guttate psoriasis, or widespread red scaly skin plaques on torso",
-            "a photo of ringworm, tinea corporis, or circular ring-shaped fungal rash with distinct round borders",
+            # Ringworm / Tinea
+            "a photo of an annular rash, ringworm, or tinea corporis with round red expanding ring",
+            "a close-up photo of ringworm rash or circular tinea fungal infection on skin",
+            "a photo of an itchy red ring on skin with distinct active circular borders",
+            # Hives / Urticaria
+            "a photo of hives, acute urticaria, transient raised itchy edematous wheals, or swollen red allergic skin plaques",
+            "a photo of urticaria wheals, widespread allergic hives, dermatographia, or raised swollen itchy welts on skin",
+            "a photo of urticaria, hives rash, large pink erythematous wheals, or widespread allergic reaction on skin",
+            "a clinical photo of widespread urticarial plaques, hives on arm, or allergic wheals with irregular borders",
+            # Psoriasis
+            "a photo of plaque psoriasis with well-demarcated thick plaques and silvery micaceous scales",
+            "a photo of plaque psoriasis or guttate psoriasis with raised thick red scaly plaques on elbows or knees",
+            # Warts
+            "a photo of skin warts, verruca vulgaris, rough cauliflower skin tags, or papilloma growths on fingers",
+            # Vitiligo
             "a photo of vitiligo, leukoderma, or stark pure white depigmented skin patches",
+            # Melanoma / Cancer
             "a photo of melanoma, dark asymmetrical black mole, or invasive skin cancer tumor",
-            "a clinical photo of hives, severe urticaria, large raised allergic welts, or swollen wheals",
-            "a photo of skin warts, verruca vulgaris, skin tags, or cauliflower-like growths",
-            "a photo of annular erythema, lupus rash, or extensive widespread body rash",
         ]
 
         # Maps each unsupported_prompts entry (by index) to its clinical disease label
         self._unsupported_prompt_labels: list[str] = [
-            "psoriasis",
-            "psoriasis",
             "ringworm",
+            "ringworm",
+            "ringworm",
+            "hives",
+            "hives",
+            "hives",
+            "hives",
+            "psoriasis",
+            "psoriasis",
+            "warts",
             "vitiligo",
             "melanoma",
-            "hives",
-            "warts",
-            "lupus",
         ]
 
         # Tier C: Healthy Skin & Cosmetics
@@ -262,8 +285,8 @@ class SkinValidator:
         # 3. Healthy unblemished skin / cosmetic face without active disease
         elif healthy_score >= 0.35 and healthy_score > lesion_score and healthy_score > unsupported_score:
             winning_category = "healthy_skin"
-        # 4. Out-of-Scope Condition (must beat lesion score by a clear margin)
-        elif unsupported_score >= 0.45 and unsupported_score > (lesion_score + 0.08):
+        # 4. Out-of-Scope Condition (unsupported condition beats lesion score or is within close margin)
+        elif unsupported_score >= 0.35 and unsupported_score >= (lesion_score - 0.05):
             winning_category = "unsupported_condition"
         # 5. Default to Target Lesion (allows Acne, Eczema, Herpes to pass freely to classifier)
         else:

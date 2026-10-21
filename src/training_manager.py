@@ -5,6 +5,7 @@ Manages asynchronous background training, dataset synchronization,
 real-time progress tracking, and accuracy safety checks (Validation Guard).
 """
 
+import copy
 import os
 import shutil
 import sys
@@ -24,7 +25,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.data_loader import load_config, create_dataloaders
+from src.data_loader import load_config, create_dataloaders, create_holdout_loader
 from src.model import build_model
 
 
@@ -167,6 +168,7 @@ class TrainingManager:
         config = load_config(self.config_path)
         target_raw_dir = config["data"]["raw_dir"]
         os.makedirs(target_raw_dir, exist_ok=True)
+        holdout_dir = config["data"].get("holdout_test_dir")
 
         # Mapping lowercase category names to TitleCase in data/raw
         category_map = {
@@ -187,6 +189,7 @@ class TrainingManager:
 
             source_folder = os.path.join(laravel_dataset_path, cat_lower)
             target_folder = os.path.join(target_raw_dir, target_class_name)
+            holdout_folder = os.path.join(holdout_dir, target_class_name) if holdout_dir else None
             os.makedirs(target_folder, exist_ok=True)
 
             valid_source_fnames = set()
@@ -200,7 +203,11 @@ class TrainingManager:
                     src_file = os.path.join(source_folder, fname)
                     if os.path.isfile(src_file):
                         dest_file = os.path.join(target_folder, f"webapp_{fname}")
-                        if not os.path.exists(dest_file):
+                        # Never re-copy an upload that is locked in the holdout test set
+                        is_locked_in_holdout = holdout_folder is not None and os.path.exists(
+                            os.path.join(holdout_folder, f"webapp_{fname}")
+                        )
+                        if not os.path.exists(dest_file) and not is_locked_in_holdout:
                             try:
                                 shutil.copy2(src_file, dest_file)
                                 copied_count += 1
@@ -208,19 +215,22 @@ class TrainingManager:
                                 self.log(f"Failed to copy {fname}: {e}")
 
             # Prune any previously synced webapp images that were deleted from webapp storage
-            if os.path.exists(target_folder):
-                for target_file in os.listdir(target_folder):
+            # (also from the holdout test set, so withdrawn scans are never kept anywhere)
+            for prune_folder in [target_folder, holdout_folder]:
+                if not prune_folder or not os.path.exists(prune_folder):
+                    continue
+                for target_file in os.listdir(prune_folder):
                     if event and event.is_set():
                         self.log("⚠ Dataset sync aborted by cancellation request.")
                         return copied_count
                     if target_file.startswith("webapp_"):
                         orig_fname = target_file[7:]  # strip 'webapp_'
                         if orig_fname not in valid_source_fnames:
-                            full_target_path = os.path.join(target_folder, target_file)
+                            full_target_path = os.path.join(prune_folder, target_file)
                             try:
                                 os.remove(full_target_path)
                                 deleted_count += 1
-                                self.log(f"Purged deleted image from training set: {target_file}")
+                                self.log(f"Purged deleted image from dataset: {target_file}")
                             except Exception as e:
                                 self.log(f"Failed to remove orphaned image {target_file}: {e}")
 
@@ -595,6 +605,17 @@ class TrainingManager:
                 train_loader, val_loader, class_names = create_dataloaders(config)
                 total_batches = len(train_loader)
 
+                # Locked holdout test set: only for standard 3-disease runs
+                holdout_loader = None if expansion_disease else create_holdout_loader(config, class_names)
+                use_holdout = holdout_loader is not None
+                if use_holdout:
+                    self.log(
+                        f"🔒 Locked holdout test set active: {len(holdout_loader.dataset)} images "
+                        f"(never trained on). The Validation Guard will judge on this set."
+                    )
+                elif not expansion_disease:
+                    self.log("ℹ No holdout test set found. Validation Guard will use the validation split.")
+
                 self._set_state(
                     stop_event=current_stop,
                     session_id=session_id,
@@ -642,8 +663,22 @@ class TrainingManager:
                 class_weights = torch.FloatTensor(weights).to(device)
                 criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-                # Baseline evaluation on current validation set
-                if baseline_acc == 0.0 and len(val_loader) > 0:
+                # Baseline evaluation
+                if use_holdout:
+                    # Measure the current production weights fresh on the locked holdout set
+                    self.log(f"Measuring {arch.upper()} production baseline on the locked holdout test set...")
+                    self._set_state(
+                        stop_event=current_stop,
+                        session_id=session_id,
+                        status="evaluating",
+                        message=f"Measuring holdout baseline for {arch.replace('_', ' ').title()}..."
+                    )
+                    _, baseline_acc = self._evaluate_baseline(model, holdout_loader, criterion, device, stop_event=current_stop)
+                    if current_stop.is_set():
+                        self._handle_cancellation(session_id)
+                        return
+                    self.log(f"Holdout baseline accuracy (current production): {baseline_acc:.2f}%")
+                elif baseline_acc == 0.0 and len(val_loader) > 0:
                     self.log(f"Evaluating baseline for {arch.upper()} on validation set...")
                     self._set_state(
                         stop_event=current_stop,
@@ -670,7 +705,9 @@ class TrainingManager:
                 scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
                 session_best_val_acc = 0.0
-                best_val_acc = baseline_acc
+                # With a holdout set, the best epoch is picked purely by validation accuracy;
+                # the holdout set is only used once, for the final promotion decision.
+                best_val_acc = -1.0 if use_holdout else baseline_acc
                 new_best_model_weights = None
                 total_steps = epochs * total_batches
                 step_count = 0
@@ -794,14 +831,15 @@ class TrainingManager:
                     if epoch_val_acc > session_best_val_acc:
                         session_best_val_acc = epoch_val_acc
 
-                    is_beat_baseline = epoch_val_acc >= baseline_acc
+                    is_beat_baseline = (not use_holdout) and epoch_val_acc >= baseline_acc
                     is_new_best = epoch_val_acc > best_val_acc
-                    if is_beat_baseline and is_new_best:
+                    if (use_holdout or is_beat_baseline) and is_new_best:
                         best_val_acc = epoch_val_acc
+                        # Snapshot (deep copy) so later epochs cannot overwrite the saved best weights
                         new_best_model_weights = {
                             "epoch": epoch,
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
+                            "model_state_dict": copy.deepcopy(model.state_dict()),
+                            "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
                             "val_acc": epoch_val_acc,
                             "class_names": class_names,
                             "architecture": arch,
@@ -814,6 +852,7 @@ class TrainingManager:
                         f"Train Loss: {epoch_train_loss:.4f} Acc: {epoch_train_acc:.2f}% | "
                         f"Val Loss: {epoch_val_loss:.4f} Acc: {epoch_val_acc:.2f}%"
                         + (" ⭐ (Beat Baseline)" if is_beat_baseline else "")
+                        + (" ⭐ (Best Val So Far)" if use_holdout and is_new_best else "")
                     )
 
                     with self._lock:
@@ -833,14 +872,42 @@ class TrainingManager:
                     return
 
                 self.log(f"--- VALIDATION GUARD: {arch.upper()} ---")
-                self.log(f"Baseline: {baseline_acc:.2f}% | Session Best: {session_best_val_acc:.2f}%")
+
+                if use_holdout:
+                    # Score the best-validation epoch on the locked holdout set (same images as the baseline)
+                    candidate_acc = 0.0
+                    if new_best_model_weights is not None:
+                        self._set_state(
+                            stop_event=current_stop,
+                            session_id=session_id,
+                            status="evaluating",
+                            message=f"Testing {arch.replace('_', ' ').title()} on the locked holdout set..."
+                        )
+                        model.load_state_dict(new_best_model_weights["model_state_dict"])
+                        _, candidate_acc = self._evaluate_baseline(model, holdout_loader, criterion, device, stop_event=current_stop)
+                        if current_stop.is_set():
+                            self._handle_cancellation(session_id)
+                            return
+                        new_best_model_weights["holdout_acc"] = candidate_acc
+                    self.log(
+                        f"Best epoch validation accuracy: {best_val_acc:.2f}% "
+                        f"(epoch {new_best_model_weights['epoch'] + 1 if new_best_model_weights else '-'})"
+                    )
+                    self.log(f"Baseline (Holdout Test): {baseline_acc:.2f}% | Session Best: {candidate_acc:.2f}%")
+                    passed_guard = new_best_model_weights is not None and candidate_acc > baseline_acc
+                    guard_scope = "on the locked holdout test"
+                else:
+                    candidate_acc = session_best_val_acc
+                    self.log(f"Baseline: {baseline_acc:.2f}% | Session Best: {session_best_val_acc:.2f}%")
+                    passed_guard = new_best_model_weights is not None and session_best_val_acc >= baseline_acc
+                    guard_scope = "on validation"
 
                 target_prod_path = os.path.join("models/production", f"best_model_{arch}.pth")
                 backup_prod_path = os.path.join("models/production", f"best_model_{arch}_backup.pth")
                 os.makedirs("models/production", exist_ok=True)
 
-                if new_best_model_weights is not None and session_best_val_acc >= baseline_acc:
-                    self.log(f"✅ PASSED GUARD: {arch.upper()} improved ({baseline_acc:.2f}% -> {session_best_val_acc:.2f}%).")
+                if passed_guard:
+                    self.log(f"✅ PASSED GUARD: {arch.upper()} improved {guard_scope} ({baseline_acc:.2f}% -> {candidate_acc:.2f}%).")
                     if os.path.exists(target_prod_path):
                         shutil.copy2(target_prod_path, backup_prod_path)
                     torch.save(new_best_model_weights, target_prod_path)
@@ -852,10 +919,13 @@ class TrainingManager:
                         self.log(f"💾 Safe-keeping Checkpoint: Expanded model saved -> {ckpt_4class_path}")
                     self.log(f"🚀 Deployed to production -> {target_prod_path}")
                     promoted_models.append(arch)
-                    results_summary.append(f"{arch.upper()}: {session_best_val_acc:.2f}% (Promoted)")
+                    results_summary.append(f"{arch.upper()}: {candidate_acc:.2f}% (Promoted)")
                 else:
-                    self.log(f"🛡 GUARD PRESERVED: {arch.upper()} session best ({session_best_val_acc:.2f}%) did not beat baseline ({baseline_acc:.2f}%).")
-                    results_summary.append(f"{arch.upper()}: Baseline {baseline_acc:.2f}% kept (Session: {session_best_val_acc:.2f}%)")
+                    self.log(f"🛡 GUARD PRESERVED: {arch.upper()} session best ({candidate_acc:.2f}%) did not beat baseline ({baseline_acc:.2f}%) {guard_scope}.")
+                    results_summary.append(f"{arch.upper()}: Baseline {baseline_acc:.2f}% kept (Session: {candidate_acc:.2f}%)")
+
+                # Free snapshot memory before the next backbone
+                new_best_model_weights = None
 
             if current_stop.is_set():
                 self._handle_cancellation(session_id)

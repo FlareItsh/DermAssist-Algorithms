@@ -182,6 +182,60 @@ def get_val_transforms(config: dict) -> transforms.Compose:
 
 
 # ============================================================
+# Image Grouping (shared by split logic and holdout test set)
+# ============================================================
+
+VALID_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+
+
+def get_image_group(file_path: str) -> str:
+    """
+    Return the source-image group name for a file.
+
+    Augmented copies named 'aug_<digits>_<original>' map back to '<original>',
+    so an original and all of its augmented copies share one group.
+    """
+    filename = os.path.basename(file_path)
+    name, _ = os.path.splitext(filename)
+    if name.startswith("aug_"):
+        parts = name.split("_")
+        if len(parts) > 2 and parts[1].isdigit():
+            idx = 2
+            while idx < len(parts) and parts[idx].isdigit():
+                idx += 1
+            return "_".join(parts[idx:])
+    return name
+
+
+def get_holdout_dir(config: dict) -> Optional[str]:
+    """Return the configured locked holdout test directory, if any."""
+    return config.get("data", {}).get("holdout_test_dir")
+
+
+def get_holdout_groups(config: dict, class_names: Optional[list] = None) -> set:
+    """
+    Collect (class_name, group_name) pairs for every image in the locked holdout
+    test set. Used to guarantee these images never enter training/validation.
+    """
+    holdout_dir = get_holdout_dir(config)
+    groups = set()
+    if not holdout_dir or not os.path.isdir(holdout_dir):
+        return groups
+
+    classes = class_names or sorted(
+        d for d in os.listdir(holdout_dir) if os.path.isdir(os.path.join(holdout_dir, d))
+    )
+    for cls_name in classes:
+        cls_dir = Path(holdout_dir) / cls_name
+        if not cls_dir.is_dir():
+            continue
+        for img_path in cls_dir.rglob("*"):
+            if img_path.is_file() and img_path.suffix.lower() in VALID_IMAGE_EXTENSIONS:
+                groups.add((cls_name, get_image_group(str(img_path))))
+    return groups
+
+
+# ============================================================
 # Dataset
 # ============================================================
 
@@ -304,21 +358,24 @@ def create_dataloaders(
     )
     discovered_classes = full_dataset.classes
 
+    # Safety net: never train or validate on images locked in the holdout test set
+    holdout_groups = get_holdout_groups(config, discovered_classes)
+    if holdout_groups:
+        before_count = len(full_dataset.samples)
+        full_dataset.samples = [
+            (img_path, label)
+            for img_path, label in full_dataset.samples
+            if (discovered_classes[label], get_image_group(img_path)) not in holdout_groups
+        ]
+        excluded_count = before_count - len(full_dataset.samples)
+        print(
+            f"[DataLoader] Holdout protection: {len(holdout_groups)} locked test images | "
+            f"{excluded_count} matching files excluded from train/val"
+        )
+
     # Split into train / validation using group-based splitting to prevent data leakage of augmented images
     from collections import defaultdict
     import random
-
-    def get_image_group(file_path: str) -> str:
-        filename = os.path.basename(file_path)
-        name, _ = os.path.splitext(filename)
-        if name.startswith("aug_"):
-            parts = name.split("_")
-            if len(parts) > 2 and parts[1].isdigit():
-                idx = 2
-                while idx < len(parts) and parts[idx].isdigit():
-                    idx += 1
-                return "_".join(parts[idx:])
-        return name
 
     # Group sample indices by original image ID
     groups = defaultdict(list)
@@ -400,6 +457,38 @@ def create_dataloaders(
 
     print(f"[DataLoader] Train: {train_size} samples | Val: {val_size} samples")
     return train_loader, val_loader, discovered_classes
+
+
+def create_holdout_loader(
+    config: dict,
+    class_names: Optional[list] = None,
+) -> Optional[DataLoader]:
+    """
+    Create a DataLoader for the locked holdout test set (no augmentation).
+
+    Returns None when no holdout directory is configured or it holds no images,
+    so callers can fall back to validation-based behaviour.
+    """
+    holdout_dir = get_holdout_dir(config)
+    if not holdout_dir or not os.path.isdir(holdout_dir):
+        return None
+
+    names = class_names or config["model"].get("class_names", None)
+    holdout_dataset = SkinLesionDataset(
+        data_dir=holdout_dir,
+        transform=get_val_transforms(config),
+        class_names=names,
+    )
+    if len(holdout_dataset) == 0:
+        return None
+
+    return DataLoader(
+        holdout_dataset,
+        batch_size=config["training"]["batch_size"],
+        shuffle=False,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
 
 
 class TransformSubset(Dataset):
