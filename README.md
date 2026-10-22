@@ -265,6 +265,34 @@ All settings are in `config.yaml`:
 
 ---
 
+## ☁️ Deploy to Modal (Serverless GPU)
+
+DermAssist AI is ready to be hosted serverless on [Modal](https://modal.com) with automatic scale-to-zero when idle.
+
+### Prerequisites
+```bash
+pip install modal
+modal setup
+```
+
+### Serve Locally for Testing
+```bash
+modal serve modal_app.py
+```
+
+### Deploy to Production
+```bash
+modal deploy modal_app.py
+```
+
+Once deployed, Modal will output your public endpoint (e.g. `https://<your-workspace>--dermassist-ai-fastapi-app.modal.run`).  
+Configure this URL in your Laravel backend `.env`:
+```env
+AI_SERVER_URL=https://<your-workspace>--dermassist-ai-fastapi-app.modal.run
+```
+
+---
+
 ## 📝 License
 
 This project is part of the DermAssist platform.
