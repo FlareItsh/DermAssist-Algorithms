@@ -11,6 +11,7 @@ Supports:
   - Train/validation splitting
 """
 
+import hashlib
 import os
 import sys
 import yaml
@@ -236,16 +237,17 @@ class SkinLesionDataset(Dataset):
 
         active_set: Optional[Set[str]] = set(active_image_files) if active_image_files is not None else None
 
-        # Collect all image paths and their labels
+        # Collect all image paths and their labels with SHA-256 deduplication & corruption check
         self.samples = []
         valid_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+        seen_hashes = set()
 
         for cls_name in self.classes:
             cls_dir = self.data_dir / cls_name
             if not cls_dir.is_dir():
                 continue
             # Scan recursively to support subdirectories (e.g. normal_camera vs dermoscopic)
-            for img_path in cls_dir.rglob("*"):
+            for img_path in sorted(cls_dir.rglob("*")):
                 if img_path.is_file() and img_path.suffix.lower() in valid_extensions:
                     if img_path.name.lower().startswith("aug_"):
                         continue
@@ -253,6 +255,24 @@ class SkinLesionDataset(Dataset):
                     if active_set is not None and img_path.name.startswith("webapp_"):
                         if img_path.name not in active_set:
                             continue
+
+                    # Verify image integrity
+                    try:
+                        with Image.open(img_path) as test_img:
+                            test_img.verify()
+                    except Exception:
+                        continue
+
+                    # SHA-256 hash deduplication
+                    try:
+                        with open(img_path, "rb") as f:
+                            file_hash = hashlib.sha256(f.read()).hexdigest()
+                        if file_hash in seen_hashes:
+                            continue
+                        seen_hashes.add(file_hash)
+                    except Exception:
+                        continue
+
                     self.samples.append((str(img_path), self.class_to_idx[cls_name]))
 
         print(f"[DataLoader] Loaded {len(self.samples)} images "

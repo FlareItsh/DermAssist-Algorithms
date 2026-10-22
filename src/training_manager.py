@@ -160,10 +160,22 @@ class TrainingManager:
         """
         self.log("Syncing newly gathered dataset images from webapp storage...")
         if not laravel_dataset_path:
-            # Default to standard project sibling directory
-            laravel_dataset_path = os.path.abspath(
-                os.path.join(PROJECT_ROOT, "..", "DermAssist-API", "storage", "app", "public", "dataset")
-            )
+            from src.path_resolver import get_api_storage_dataset_dir
+            resolved = get_api_storage_dataset_dir()
+            if resolved and os.path.isdir(str(resolved)):
+                laravel_dataset_path = str(resolved)
+            else:
+                candidates = [
+                    os.path.abspath(os.path.join(PROJECT_ROOT, "..", "api", "storage", "app", "public", "dataset")),
+                    os.path.abspath(os.path.join(PROJECT_ROOT, "..", "DermAssist-API", "storage", "app", "public", "dataset")),
+                    os.path.abspath(os.path.join(os.getcwd(), "..", "api", "storage", "app", "public", "dataset")),
+                ]
+                for c in candidates:
+                    if os.path.isdir(c):
+                        laravel_dataset_path = c
+                        break
+                if not laravel_dataset_path:
+                    laravel_dataset_path = candidates[0]
 
         if not os.path.exists(laravel_dataset_path):
             self.log(f"⚠ Dataset path not found: {laravel_dataset_path}. Skipping sync.")
