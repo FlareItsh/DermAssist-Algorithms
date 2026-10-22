@@ -275,12 +275,18 @@ pip install modal
 modal setup
 ```
 
-### Serve Locally for Testing
+### 1. Upload Model Weights to Modal Volume
+Since PyTorch model weights are ~1.5 GB (exceeding GitHub's 100 MB limit), upload them directly to your Modal Volume once:
+```bash
+modal volume put dermassist-models models/production /production
+```
+
+### 2. Serve Locally for Testing
 ```bash
 modal serve modal_app.py
 ```
 
-### Deploy to Production
+### 3. Deploy to Production
 ```bash
 modal deploy modal_app.py
 ```

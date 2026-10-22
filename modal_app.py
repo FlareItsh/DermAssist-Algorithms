@@ -58,7 +58,7 @@ volume = modal.Volume.from_name("dermassist-models", create_if_missing=True)
     gpu="T4",  # High-speed GPU inference. Set to None for CPU-only.
     timeout=600,  # 10 min timeout for retraining jobs
     scaledown_window=60,  # Automatically scale down to 0 after 60s idle ($0 idle cost)
-    volumes={"/root/algorithms/models/checkpoints": volume},
+    volumes={"/root/algorithms/models": volume},
 )
 @modal.asgi_app()
 def fastapi_app():
