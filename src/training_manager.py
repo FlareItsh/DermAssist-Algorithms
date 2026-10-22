@@ -36,7 +36,7 @@ class TrainingManager:
 
     def __init__(self, config_path: str = "config.yaml"):
         self.config_path = config_path
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
         self._current_stop_event: Optional[threading.Event] = None
         self._current_session_id: int = 0
@@ -50,6 +50,8 @@ class TrainingManager:
             "status": "idle",  # idle, syncing, training, evaluating, completed, failed, cancelled
             "progress": 0.0,
             "architecture": "swin_transformer",
+            "training_mode": "quick",
+            "fresh_start": False,
             "current_epoch": 0,
             "total_epochs": 0,
             "current_batch": 0,
@@ -84,8 +86,8 @@ class TrainingManager:
         """Backward-compatibility shim for external inspections."""
         return self._current_stop_event if self._current_stop_event is not None else threading.Event()
 
-    def log(self, message: str):
-        """Append a log message thread-safely."""
+    def log(self, message: str, replace_last: bool = False):
+        """Append or update a log message thread-safely."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         entry = f"[{timestamp}] {message}"
         try:
@@ -94,9 +96,12 @@ class TrainingManager:
             safe_entry = entry.encode("ascii", errors="replace").decode("ascii")
             print(f"[TrainingManager] {safe_entry}")
         with self._lock:
-            self.state["logs"].append(entry)
-            if len(self.state["logs"]) > 200:
-                self.state["logs"].pop(0)
+            if replace_last and len(self.state["logs"]) > 0:
+                self.state["logs"][-1] = entry
+            else:
+                self.state["logs"].append(entry)
+                if len(self.state["logs"]) > 500:
+                    self.state["logs"].pop(0)
 
     def get_status(self) -> Dict[str, Any]:
         """Return a copy of the current training status."""
@@ -155,10 +160,22 @@ class TrainingManager:
         """
         self.log("Syncing newly gathered dataset images from webapp storage...")
         if not laravel_dataset_path:
-            # Default to standard project sibling directory
-            laravel_dataset_path = os.path.abspath(
-                os.path.join(PROJECT_ROOT, "..", "DermAssist-API", "storage", "app", "public", "dataset")
-            )
+            from src.path_resolver import get_api_storage_dataset_dir
+            resolved = get_api_storage_dataset_dir()
+            if resolved and os.path.isdir(str(resolved)):
+                laravel_dataset_path = str(resolved)
+            else:
+                candidates = [
+                    os.path.abspath(os.path.join(PROJECT_ROOT, "..", "api", "storage", "app", "public", "dataset")),
+                    os.path.abspath(os.path.join(PROJECT_ROOT, "..", "DermAssist-API", "storage", "app", "public", "dataset")),
+                    os.path.abspath(os.path.join(os.getcwd(), "..", "api", "storage", "app", "public", "dataset")),
+                ]
+                for c in candidates:
+                    if os.path.isdir(c):
+                        laravel_dataset_path = c
+                        break
+                if not laravel_dataset_path:
+                    laravel_dataset_path = candidates[0]
 
         if not os.path.exists(laravel_dataset_path):
             self.log(f"⚠ Dataset path not found: {laravel_dataset_path}. Skipping sync.")
@@ -298,6 +315,9 @@ class TrainingManager:
         sync_dataset: bool = True,
         learning_rate: Optional[float] = None,
         expansion_disease: Optional[str] = None,
+        training_mode: str = "quick",
+        fresh_start: bool = False,
+        active_image_files: Optional[List[str]] = None,
     ) -> bool:
         """
         Start the training loop in a non-blocking background thread.
@@ -362,6 +382,8 @@ class TrainingManager:
                 "status": "syncing" if sync_dataset else "training",
                 "progress": 0.0,
                 "architecture": arch,
+                "training_mode": training_mode,
+                "fresh_start": fresh_start,
                 "current_epoch": 0,
                 "total_epochs": epochs,
                 "current_batch": 0,
@@ -376,7 +398,11 @@ class TrainingManager:
                 "message": (
                     f"Initializing expansion training for {expansion_disease.title()}..."
                     if expansion_disease
-                    else "Initializing training pipeline..."
+                    else (
+                        "Initializing rapid incremental tuning..."
+                        if training_mode == "quick"
+                        else "Initializing training pipeline..."
+                    )
                 ),
                 "eta_seconds": 0,
                 "elapsed_seconds": 0,
@@ -395,7 +421,7 @@ class TrainingManager:
 
         self._thread = threading.Thread(
             target=self._run_training_worker,
-            args=(arch, epochs, sync_dataset, learning_rate, expansion_disease, session_stop_event, session_id),
+            args=(arch, epochs, sync_dataset, learning_rate, expansion_disease, session_stop_event, session_id, training_mode, fresh_start, active_image_files),
             daemon=True,
         )
         self._thread.start()
@@ -408,7 +434,10 @@ class TrainingManager:
         """
         active_thread = None
         with self._lock:
-            if self._current_stop_event is None and (self._thread is None or not self._thread.is_alive()):
+            current_status = self.state.get("status")
+            if current_status in ["cancelling", "cancelled"]:
+                return True
+            if current_status not in ["syncing", "training", "evaluating"]:
                 return False
 
             if self._current_stop_event is not None:
@@ -422,12 +451,13 @@ class TrainingManager:
 
         # Fast join: if thread terminates quickly (between steps/batches), immediately mark cancelled
         if active_thread is not None and active_thread.is_alive():
-            active_thread.join(timeout=1.5)
+            active_thread.join(timeout=3.0)
 
         with self._lock:
             if active_thread is None or not active_thread.is_alive():
                 self.state["status"] = "cancelled"
                 self.state["message"] = "Training was cancelled."
+                self.state["eta_seconds"] = 0
                 self.state["completed_at"] = datetime.now().isoformat()
                 self.log("🛑 Training successfully cancelled.")
 
@@ -449,7 +479,7 @@ class TrainingManager:
 
         with torch.no_grad():
             for images, labels in val_loader:
-                if stop_event and stop_event.is_set():
+                if (stop_event and stop_event.is_set()) or self._stop_requested.is_set():
                     return 0.0, 0.0
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
@@ -472,6 +502,9 @@ class TrainingManager:
         expansion_disease: Optional[str] = None,
         stop_event: Optional[threading.Event] = None,
         session_id: Optional[int] = None,
+        training_mode: str = "quick",
+        fresh_start: bool = False,
+        active_image_files: Optional[List[str]] = None,
     ):
         """Worker thread executing the training loop with Validation Guard."""
         current_stop = stop_event or self._current_stop_event or threading.Event()
@@ -480,20 +513,47 @@ class TrainingManager:
                 self._handle_cancellation(session_id)
                 return
 
-            # Determine if retraining full ensemble or a single backbone
-            if architecture in ["ensemble", "all", "tri_model"]:
-                arch_list = ["swin_transformer", "resnet50", "efficientnet_v2"]
-                is_ensemble_run = True
+            # Determine architectures to train
+            if training_mode == "quick":
+                # Quick mode: fine-tune active production backbone (Swin-T)
+                if architecture in ["ensemble", "all", "tri_model"] or not architecture:
+                    active_arch = load_config(self.config_path)["advanced"].get("active_architecture", "swin_transformer")
+                    arch_list = [active_arch]
+                    is_ensemble_run = False
+                else:
+                    arch_list = [architecture]
+                    is_ensemble_run = False
             else:
-                arch_list = [architecture]
-                is_ensemble_run = False
+                # Full mode: retrain all 3 backbones if ensemble requested
+                if architecture in ["ensemble", "all", "tri_model"]:
+                    arch_list = ["swin_transformer", "resnet50", "efficientnet_v2"]
+                    is_ensemble_run = True
+                else:
+                    arch_list = [architecture]
+                    is_ensemble_run = False
 
             total_models = len(arch_list)
-            mode_desc = f"Expansion Run (+{expansion_disease.title()})" if expansion_disease else "Standard 3-Disease Retraining"
-            self.log(
-                f"Starting {'Ensemble' if is_ensemble_run else 'Single'} {mode_desc}: "
-                f"Models={', '.join([a.upper() for a in arch_list])}, Epochs/Model={epochs}"
+            pipeline_name = (
+                f"EXPANSION RUN (+{expansion_disease.upper()})"
+                if expansion_disease
+                else (
+                    f"⚡ RAPID QUICK-TUNE ({arch_list[0].upper()})"
+                    if training_mode == "quick"
+                    else ("TRI-MODEL ENSEMBLE" if is_ensemble_run else arch_list[0].upper())
+                )
             )
+            self.log("=" * 64)
+            self.log("   DERMASSIST - MULTI-MODEL BENCHMARK TRAINING PIPELINE")
+            self.log("=" * 64)
+            self.log(f"   Architecture Pipeline : {pipeline_name}")
+            self.log(f"   Training Mode         : {'⚡ QUICK INCREMENTAL (<30s)' if training_mode == 'quick' else '🔄 FULL BENCHMARK RETRAIN'}")
+            self.log(f"   Checkpoint Strategy   : {'🌱 FRESH START (No Checkpoints)' if fresh_start else '📦 RESUME / FINE-TUNE'}")
+            self.log(f"   Active Models         : {', '.join([a.upper() for a in arch_list])}")
+            self.log(f"   Epochs Per Backbone   : {epochs} epoch(s)")
+            self.log(f"   Dataset Auto-Sync     : {'Enabled' if sync_dataset else 'Disabled'}")
+            if active_image_files:
+                self.log(f"   Active Image Scope    : {len(active_image_files)} custom webapp scan(s) selected")
+            self.log("=" * 64)
 
             # Configure target classes explicitly to guarantee zero conflict between standard retraining and expansion
             if expansion_disease:
@@ -539,7 +599,17 @@ class TrainingManager:
                 if expansion_disease:
                     self.sync_expansion_disease(expansion_disease, stop_event=current_stop)
 
-            # 🛡️ Dual-Safekeeping: When expanding, archive 3-disease baseline models
+            # 🛡️ Dual-Safekeeping: Archive baseline models if fresh_start or expanding
+            if fresh_start:
+                backup_fresh_dir = "models/production_checkpoints_backup"
+                os.makedirs(backup_fresh_dir, exist_ok=True)
+                prod_dir = "models/production"
+                if os.path.exists(prod_dir):
+                    for f in os.listdir(prod_dir):
+                        if f.endswith(".pth") and not f.endswith("_backup.pth"):
+                            shutil.copy2(os.path.join(prod_dir, f), os.path.join(backup_fresh_dir, f))
+                    self.log(f"🛡️ Safekeeping: Production checkpoints safely archived in {backup_fresh_dir}/ before fresh training.")
+
             if expansion_disease:
                 backup_3class_dir = "models/production_3class_backup"
                 os.makedirs(backup_3class_dir, exist_ok=True)
@@ -555,10 +625,12 @@ class TrainingManager:
                 return
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.log(f"Compute device: {device}")
+            self.log(f"Compute hardware device : {str(device).upper()} (PyTorch {torch.__version__})")
 
             promoted_models = []
             results_summary = []
+            smoothed_step_duration: Optional[float] = None
+            avg_val_duration: float = 3.0
 
             for arch_idx, arch in enumerate(arch_list):
                 if current_stop.is_set():
@@ -566,9 +638,9 @@ class TrainingManager:
                     return
 
                 model_num = arch_idx + 1
-                self.log("=" * 60)
+                self.log("-" * 64)
                 self.log(f"▶ [{model_num}/{total_models}] TRAINING BACKBONE: {arch.upper()}")
-                self.log("=" * 60)
+                self.log("-" * 64)
 
                 self._set_state(
                     stop_event=current_stop,
@@ -591,8 +663,13 @@ class TrainingManager:
                     config["training"]["learning_rate"] = learning_rate
 
                 # Step 2: Dataloaders
-                self.log(f"Building clinical data loaders for {arch.upper()} with classes: {target_class_names}...")
-                train_loader, val_loader, class_names = create_dataloaders(config)
+                self.log(f"Building clinical data loaders for {arch.upper()} with classes: {target_class_names} (mode={training_mode})...")
+                train_loader, val_loader, class_names = create_dataloaders(
+                    config,
+                    mode=training_mode,
+                    exemplar_limit=30,
+                    active_image_files=active_image_files,
+                )
                 total_batches = len(train_loader)
 
                 self._set_state(
@@ -614,7 +691,7 @@ class TrainingManager:
                     prod_model_path = os.path.join("models/production", "best_model.pth")
 
                 baseline_acc = 0.0
-                if os.path.exists(prod_model_path):
+                if not fresh_start and os.path.exists(prod_model_path):
                     try:
                         self.log(f"Loading existing weights from: {prod_model_path}")
                         ckpt = torch.load(prod_model_path, map_location=device)
@@ -624,10 +701,17 @@ class TrainingManager:
                         self.log(f"Prior checkpoint validation accuracy: {baseline_acc:.2f}%")
                     except Exception as e:
                         self.log(f"Could not load checkpoint ({e}). Training from backbone initialization.")
+                elif fresh_start:
+                    self.log(f"🌱 FRESH START: Existing checkpoints bypassed for {arch.upper()}. Initializing directly from ImageNet base weights.")
 
                 if current_stop.is_set():
                     self._handle_cancellation(session_id)
                     return
+
+                # Freeze backbone in quick mode to compute gradients only for classifier head
+                if training_mode == "quick":
+                    model._freeze_backbone()
+                    self.log(f"🧊 Frozen {arch.upper()} feature backbone: Training only 512-dim classification head.")
 
                 # Calculate class weights
                 from collections import Counter
@@ -643,7 +727,8 @@ class TrainingManager:
                 criterion = nn.CrossEntropyLoss(weight=class_weights)
 
                 # Baseline evaluation on current validation set
-                if baseline_acc == 0.0 and len(val_loader) > 0:
+                # In quick mode, always measure baseline directly on this validation loader for fair comparison
+                if (training_mode == "quick" or baseline_acc == 0.0) and len(val_loader) > 0:
                     self.log(f"Evaluating baseline for {arch.upper()} on validation set...")
                     self._set_state(
                         stop_event=current_stop,
@@ -665,8 +750,10 @@ class TrainingManager:
                 )
 
                 # Setup Optimizer & Scheduler
-                lr = learning_rate or (0.00005 if arch == "swin_transformer" else 0.0001)
-                optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                default_lr = 0.001 if training_mode == "quick" else (0.00005 if arch == "swin_transformer" else 0.0001)
+                lr = learning_rate or default_lr
+                optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
                 scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
                 best_val_acc = baseline_acc
@@ -702,6 +789,7 @@ class TrainingManager:
                             self._handle_cancellation(session_id)
                             return
 
+                        batch_start_time = time.time()
                         images, labels = images.to(device), labels.to(device)
                         optimizer.zero_grad()
                         outputs = model(images)
@@ -709,6 +797,12 @@ class TrainingManager:
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
+
+                        batch_duration = max(time.time() - batch_start_time, 0.001)
+                        if smoothed_step_duration is None:
+                            smoothed_step_duration = batch_duration
+                        else:
+                            smoothed_step_duration = (0.85 * smoothed_step_duration) + (0.15 * batch_duration)
 
                         if current_stop.is_set():
                             self._handle_cancellation(session_id)
@@ -720,7 +814,8 @@ class TrainingManager:
                         correct += predicted.eq(labels).sum().item()
                         step_count += 1
 
-                        if batch_idx % 5 == 0 or batch_idx == total_batches - 1:
+                        # Periodic progress update & live terminal bar
+                        if batch_idx % 2 == 0 or batch_idx == total_batches - 1:
                             if current_stop.is_set():
                                 self._handle_cancellation(session_id)
                                 return
@@ -733,12 +828,12 @@ class TrainingManager:
                             current_train_acc = 100.0 * correct / max(total, 1)
                             current_train_loss = running_loss / max(total, 1)
 
-                            elapsed = time.time() - self.state["start_time"]
                             total_estimated_steps = total_steps * total_models
                             cumulative_steps = (arch_idx * total_steps) + step_count
-                            rate = cumulative_steps / max(elapsed, 0.1)
-                            remaining_steps = total_estimated_steps - cumulative_steps
-                            eta = int(remaining_steps / max(rate, 0.001))
+                            remaining_steps = max(0, total_estimated_steps - cumulative_steps)
+                            remaining_epochs = max(0, ((total_models - arch_idx - 1) * epochs) + (epochs - (epoch + 1)))
+                            step_time = smoothed_step_duration if smoothed_step_duration is not None else batch_duration
+                            eta = int((remaining_steps * step_time) + (remaining_epochs * avg_val_duration))
 
                             self._set_state(
                                 stop_event=current_stop,
@@ -750,6 +845,23 @@ class TrainingManager:
                                 eta_seconds=eta
                             )
 
+                            # Generate ASCII progress bar for live terminal stream
+                            pct = int((batch_idx + 1) / max(total_batches, 1) * 100)
+                            bar_len = 16
+                            filled_len = int(bar_len * (batch_idx + 1) / max(total_batches, 1))
+                            bar_str = "=" * max(0, filled_len - 1) + (">" if filled_len > 0 and filled_len < bar_len else ("=" if filled_len == bar_len else ""))
+                            bar_str = bar_str.ljust(bar_len, ".")
+
+                            progress_log = (
+                                f"[STEP] Epoch {epoch + 1:2d}/{epochs:2d} [{bar_str}] {pct:3d}% "
+                                f"({batch_idx + 1}/{total_batches}) | "
+                                f"Loss: {current_train_loss:.4f} | Acc: {current_train_acc:5.2f}% | "
+                                f"Speed: {batch_duration:.2f}s/step | ETA: {eta}s"
+                            )
+                            # Update terminal line in-place for active step, or append when done with epoch
+                            is_epoch_done = (batch_idx == total_batches - 1)
+                            self.log(progress_log, replace_last=(batch_idx > 0 and not is_epoch_done))
+
                     # Validation Phase
                     if current_stop.is_set():
                         self._handle_cancellation(session_id)
@@ -757,6 +869,7 @@ class TrainingManager:
 
                     scheduler.step()
                     model.eval()
+                    val_start_time = time.time()
                     val_loss_sum = 0.0
                     val_correct = 0
                     val_total = 0
@@ -784,6 +897,9 @@ class TrainingManager:
                     if current_stop.is_set():
                         self._handle_cancellation(session_id)
                         return
+
+                    val_duration = max(time.time() - val_start_time, 0.5)
+                    avg_val_duration = (0.7 * avg_val_duration) + (0.3 * val_duration)
 
                     epoch_train_loss = running_loss / max(total, 1)
                     epoch_train_acc = 100.0 * correct / max(total, 1)
@@ -870,6 +986,7 @@ class TrainingManager:
                 if not current_stop.is_set() and (session_id is None or session_id == self._current_session_id):
                     self.state["status"] = "completed"
                     self.state["progress"] = 100.0
+                    self.state["eta_seconds"] = 0
                     self.state["model_promoted"] = len(promoted_models) > 0
                     self.state["completed_at"] = datetime.now().isoformat()
                     self.state["architecture"] = "ensemble" if is_ensemble_run else arch_list[0]
@@ -893,6 +1010,7 @@ class TrainingManager:
                 if session_id is None or session_id == self._current_session_id:
                     self.state["status"] = "failed"
                     self.state["message"] = f"Training failed: {str(e)}"
+                    self.state["eta_seconds"] = 0
                     self.state["completed_at"] = datetime.now().isoformat()
 
     def _handle_cancellation(self, session_id: Optional[int] = None):
@@ -907,8 +1025,65 @@ class TrainingManager:
             if session_id is None or session_id == self._current_session_id:
                 self.state["status"] = "cancelled"
                 self.state["message"] = "Training was cancelled."
+                self.state["eta_seconds"] = 0
                 self.state["completed_at"] = datetime.now().isoformat()
         self.log("🛑 Training safely aborted.")
+
+    def rollback_model(self, architecture: str = "ensemble") -> Dict[str, Any]:
+        """
+        Roll back active production weights to the previous backup checkpoint.
+        """
+        with self._lock:
+            if self.state["status"] in ["training", "syncing", "evaluating"]:
+                return {
+                    "success": False,
+                    "message": "Cannot rollback weights while model retraining is actively in progress.",
+                }
+
+        arch_list = ["resnet50", "efficientnet_v2", "swin_transformer"] if architecture == "ensemble" else [architecture]
+        restored = []
+        errors = []
+
+        for arch in arch_list:
+            target_prod_path = os.path.join("models/production", f"best_model_{arch}.pth")
+            backup_prod_path = os.path.join("models/production", f"best_model_{arch}_backup.pth")
+
+            if not os.path.exists(backup_prod_path):
+                # Check legacy backup path
+                legacy_backup = os.path.join("models/production", "best_model_backup.pth")
+                if os.path.exists(legacy_backup) and arch == "resnet50":
+                    backup_prod_path = legacy_backup
+                else:
+                    errors.append(f"No backup checkpoint found for {arch.upper()}")
+                    continue
+
+            try:
+                shutil.copy2(backup_prod_path, target_prod_path)
+                restored.append(arch)
+                self.log(f"⏪ ROLLBACK: Restored {arch.upper()} from {backup_prod_path} -> {target_prod_path}")
+            except Exception as e:
+                errors.append(f"Failed to restore {arch.upper()}: {str(e)}")
+
+        if restored:
+            # Trigger hot-reload of active predictor
+            for cb in self._on_model_promoted_callbacks:
+                try:
+                    cb()
+                except Exception as ex:
+                    self.log(f"⚠ Predictor reload callback failed during rollback: {ex}")
+
+            return {
+                "success": True,
+                "restored_architectures": restored,
+                "message": f"Successfully rolled back model weights for: {', '.join(restored)}.",
+                "errors": errors if errors else None,
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Rollback failed: {'; '.join(errors) if errors else 'No backups available'}.",
+                "errors": errors,
+            }
 
 
 # Global Singleton

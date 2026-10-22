@@ -28,6 +28,9 @@ from src.skin_validator import SkinValidator
 from src.image_quality import ImageQualityAssessor
 from src.training_manager import training_manager
 
+# Dynamic hardware acceleration
+GLOBAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 # ============================================================
 # Schemas
 # ============================================================
@@ -38,11 +41,16 @@ class StartTrainingRequest(BaseModel):
     sync_dataset: Optional[bool] = True
     learning_rate: Optional[float] = None
     expansion_disease: Optional[str] = None
+    training_mode: Optional[str] = "quick"
+    fresh_start: Optional[bool] = False
+    active_image_files: Optional[List[str]] = None
 
 class TrainingStatusResponse(BaseModel):
     status: str
     progress: float
     architecture: str
+    training_mode: Optional[str] = "quick"
+    fresh_start: Optional[bool] = False
     current_epoch: int
     total_epochs: int
     current_batch: int
@@ -130,7 +138,7 @@ def init_predictor_sync():
         ensemble_enabled = config["inference"].get("ensemble_enabled", False)
         
         if ensemble_enabled:
-            print(f"[API] ⏳ LOADING ENSEMBLE MODEL")
+            print(f"[API] ⏳ LOADING ENSEMBLE MODEL (Device: {GLOBAL_DEVICE.upper()})")
             model_paths_and_archs = [
                 ("models/production/best_model_resnet50.pth", "resnet50"),
                 ("models/production/best_model_efficientnet_v2.pth", "efficientnet_v2"),
@@ -139,7 +147,7 @@ def init_predictor_sync():
             predictor = EnsemblePredictor(
                 model_paths_and_archs=model_paths_and_archs,
                 config=config,
-                device="cpu",
+                device=GLOBAL_DEVICE,
             )
         else:
             # Check if model exists
@@ -151,12 +159,12 @@ def init_predictor_sync():
                     print(f"[API] ⚠ WARNING: No model found at {model_path}. Predict endpoint will be disabled.")
                     return None
 
-            print(f"[API] ⏳ LOADING MODEL: {active_arch.upper()} from {model_path}")
+            print(f"[API] ⏳ LOADING MODEL: {active_arch.upper()} from {model_path} (Device: {GLOBAL_DEVICE.upper()})")
             
             predictor = SkinLesionPredictor(
                 model_path=model_path,
                 config=config,
-                device="cpu", 
+                device=GLOBAL_DEVICE, 
                 architecture=active_arch
             )
         
@@ -297,7 +305,7 @@ async def predict(file: UploadFile = File(...)):
                     label="None",
                     confidence=1.0,
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type="non_skin",
                     image_quality=image_quality,
@@ -314,7 +322,7 @@ async def predict(file: UploadFile = File(...)):
                     label="None",
                     confidence=1.0,
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type="full_body_portrait",
                     image_quality=image_quality,
@@ -331,7 +339,7 @@ async def predict(file: UploadFile = File(...)):
                     label="Clear",
                     confidence=0.98,
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type=image_type,
                     image_quality=image_quality,
@@ -350,7 +358,7 @@ async def predict(file: UploadFile = File(...)):
                     label="Inconclusive",
                     confidence=round(unsupported_conf, 4),
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type=image_type,
                     image_quality=image_quality,
@@ -358,6 +366,7 @@ async def predict(file: UploadFile = File(...)):
                     clinical_feedback="This condition appears to be outside our 3 primary focus areas (Acne, Eczema, Herpes). It may represent an unsupported skin condition (such as Psoriasis, Ringworm, or other lesion). Please consult a licensed dermatologist for comprehensive clinical evaluation.",
                     out_of_scope_category=out_of_scope_cat,
                 )
+
 
         # ---- Image quality assessment (metadata only — image unchanged) ----
         # Runs on the same temp file BEFORE the predictor so we can clean up
@@ -431,16 +440,23 @@ def start_training(request: StartTrainingRequest):
         sync_dataset=request.sync_dataset if request.sync_dataset is not None else True,
         learning_rate=request.learning_rate,
         expansion_disease=request.expansion_disease,
+        training_mode=request.training_mode or "quick",
+        fresh_start=request.fresh_start or False,
+        active_image_files=request.active_image_files,
     )
     if not success:
         error_msg = getattr(training_manager, "last_start_error", None) or "A training session is already in progress."
         status_code = 422 if "Insufficient" in error_msg else 409
         raise HTTPException(status_code=status_code, detail=error_msg)
 
-    desc = f"Expansion training for {request.expansion_disease.title()}" if request.expansion_disease else f"Retraining started for {request.architecture or 'ensemble'}"
+    mode_label = "⚡ Rapid Quick-Tune" if (request.training_mode or "quick") == "quick" else "🔄 Full Retrain"
+    fresh_label = " (Fresh Start)" if request.fresh_start else ""
+    desc = f"Expansion training for {request.expansion_disease.title()}" if request.expansion_disease else f"{mode_label}{fresh_label} started for {request.architecture or 'ensemble'}"
     return {
         "message": desc,
         "status": "started",
+        "training_mode": request.training_mode or "quick",
+        "fresh_start": request.fresh_start or False,
         "epochs": request.epochs or 5,
         "expansion_disease": request.expansion_disease,
     }
@@ -457,6 +473,9 @@ def cancel_training():
     """Cancel current training session safely."""
     success = training_manager.cancel_training()
     if not success:
+        current_status = training_manager.get_status().get("status")
+        if current_status in ["cancelling", "cancelled", "idle", "completed", "failed"]:
+            return {"message": "Training is not actively running.", "status": current_status}
         raise HTTPException(status_code=400, detail="No active training session to cancel.")
     return {"message": "Cancellation request submitted.", "status": "cancelling"}
 
@@ -481,6 +500,19 @@ def trigger_reload():
     if not success:
         raise HTTPException(status_code=500, detail="Failed to reload model predictor.")
     return {"message": "Model predictor reloaded successfully.", "status": "ready"}
+
+
+class RollbackRequest(BaseModel):
+    architecture: Optional[str] = "ensemble"
+
+
+@app.post("/model/rollback", response_model=dict)
+def rollback_model_endpoint(request: RollbackRequest = RollbackRequest()):
+    """Roll back active model weights to previous backup checkpoint."""
+    res = training_manager.rollback_model(architecture=request.architecture or "ensemble")
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
 
 
 if __name__ == "__main__":

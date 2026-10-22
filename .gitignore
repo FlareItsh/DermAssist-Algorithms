@@ -43,3 +43,8 @@ training_history.png
 Thumbs.db
 
 models/
+
+# --- AI Assistant Configs ---
+.agents/
+AGENTS.md
+GEMINI.md
