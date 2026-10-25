@@ -45,3 +45,8 @@ Thumbs.db
 models/
 
 data/
+
+# --- AI Assistant Configs ---
+.agents/
+AGENTS.md
+GEMINI.md

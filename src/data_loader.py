@@ -11,6 +11,7 @@ Supports:
   - Train/validation splitting
 """
 
+import hashlib
 import os
 import sys
 import yaml
@@ -261,13 +262,17 @@ class SkinLesionDataset(Dataset):
         data_dir: str,
         transform: Optional[transforms.Compose] = None,
         class_names: Optional[list] = None,
+        active_image_files: Optional[Union[List[str], Set[str]]] = None,
     ):
         """
         Args:
-            data_dir:    Root directory containing class subdirectories.
-            transform:   Torchvision transform pipeline.
-            class_names: Optional ordered list of class names. If None,
-                         classes are inferred from subdirectory names.
+            data_dir:           Root directory containing class subdirectories.
+            transform:          Torchvision transform pipeline.
+            class_names:        Optional ordered list of class names. If None,
+                                classes are inferred from subdirectory names.
+            active_image_files: Optional list/set of active webapp image filenames
+                                to include. If provided, any webapp_* images NOT in
+                                this set will be excluded from the dataset.
         """
         self.data_dir = Path(data_dir)
         self.transform = transform
@@ -284,23 +289,49 @@ class SkinLesionDataset(Dataset):
             cls: idx for idx, cls in enumerate(self.classes)
         }
 
-        # Collect all image paths and their labels
+        active_set: Optional[Set[str]] = set(active_image_files) if active_image_files is not None else None
+
+        # Collect all image paths and their labels with SHA-256 deduplication & corruption check
         self.samples = []
         valid_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+        seen_hashes = set()
 
         for cls_name in self.classes:
             cls_dir = self.data_dir / cls_name
             if not cls_dir.is_dir():
                 continue
             # Scan recursively to support subdirectories (e.g. normal_camera vs dermoscopic)
-            for img_path in cls_dir.rglob("*"):
+            for img_path in sorted(cls_dir.rglob("*")):
                 if img_path.is_file() and img_path.suffix.lower() in valid_extensions:
                     if img_path.name.lower().startswith("aug_"):
                         continue
+                    # Decoupled selection scope: if active_image_files provided, only include matching webapp files
+                    if active_set is not None and img_path.name.startswith("webapp_"):
+                        if img_path.name not in active_set:
+                            continue
+
+                    # Verify image integrity
+                    try:
+                        with Image.open(img_path) as test_img:
+                            test_img.verify()
+                    except Exception:
+                        continue
+
+                    # SHA-256 hash deduplication
+                    try:
+                        with open(img_path, "rb") as f:
+                            file_hash = hashlib.sha256(f.read()).hexdigest()
+                        if file_hash in seen_hashes:
+                            continue
+                        seen_hashes.add(file_hash)
+                    except Exception:
+                        continue
+
                     self.samples.append((str(img_path), self.class_to_idx[cls_name]))
 
         print(f"[DataLoader] Loaded {len(self.samples)} images "
-              f"across {len(self.classes)} classes from '{data_dir}'")
+              f"across {len(self.classes)} classes from '{data_dir}'"
+              f"{f' (active scope filter: {len(active_set)} selected webapp files)' if active_set is not None else ''}")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -322,13 +353,19 @@ class SkinLesionDataset(Dataset):
 def create_dataloaders(
     config: dict,
     data_dir: Optional[str] = None,
+    mode: str = "full",
+    exemplar_limit: int = 30,
+    active_image_files: Optional[Union[List[str], Set[str]]] = None,
 ) -> Tuple[DataLoader, DataLoader, list]:
     """
     Create training and validation DataLoaders.
 
     Args:
-        config:   Parsed config.yaml dictionary.
-        data_dir: Override for the data directory path.
+        config:             Parsed config.yaml dictionary.
+        data_dir:           Override for the data directory path.
+        mode:               "full" for complete dataset training, "quick" for rapid fine-tuning.
+        exemplar_limit:     Maximum baseline samples per class to keep as anchors in quick mode.
+        active_image_files: Optional list/set of webapp image filenames to selectively include.
 
     Returns:
         (train_loader, val_loader, class_names)
@@ -355,8 +392,25 @@ def create_dataloaders(
         data_dir=data_dir,
         transform=None,  # We'll apply transforms after splitting
         class_names=class_names,
+        active_image_files=active_image_files,
     )
     discovered_classes = full_dataset.classes
+
+    from collections import defaultdict
+    import random
+
+    # Helper function for grouping augmentations
+    def get_image_group(file_path: str) -> str:
+        filename = os.path.basename(file_path)
+        name, _ = os.path.splitext(filename)
+        if name.startswith("aug_"):
+            parts = name.split("_")
+            if len(parts) > 2 and parts[1].isdigit():
+                idx = 2
+                while idx < len(parts) and parts[idx].isdigit():
+                    idx += 1
+                return "_".join(parts[idx:])
+        return name
 
     # Safety net: never train or validate on images locked in the holdout test set
     holdout_groups = get_holdout_groups(config, discovered_classes)
@@ -373,10 +427,39 @@ def create_dataloaders(
             f"{excluded_count} matching files excluded from train/val"
         )
 
-    # Split into train / validation using group-based splitting to prevent data leakage of augmented images
-    from collections import defaultdict
-    import random
+    # Quick Mode: Filter dataset down to webapp-contributed images + anchor exemplars
+    if mode == "quick":
+        class_samples = defaultdict(lambda: {"webapp": [], "baseline": []})
+        for img_path, label in full_dataset.samples:
+            fname = os.path.basename(img_path)
+            if fname.startswith("webapp_"):
+                class_samples[label]["webapp"].append((img_path, label))
+            else:
+                class_samples[label]["baseline"].append((img_path, label))
 
+        filtered_samples = []
+        rng = random.Random(42)
+        total_webapp = 0
+        total_baseline = 0
+
+        for label in range(len(discovered_classes)):
+            cat_dict = class_samples[label]
+            webapps = cat_dict["webapp"]
+            baselines = cat_dict["baseline"]
+
+            total_webapp += len(webapps)
+            filtered_samples.extend(webapps)
+
+            sample_count = min(len(baselines), exemplar_limit)
+            selected_baselines = rng.sample(baselines, sample_count) if baselines else []
+            total_baseline += len(selected_baselines)
+            filtered_samples.extend(selected_baselines)
+
+        full_dataset.samples = filtered_samples
+        print(
+            f"[DataLoader] ⚡ Quick Mode Active: {total_webapp} new webapp images + "
+            f"{total_baseline} baseline anchor exemplars = {len(filtered_samples)} total samples."
+        )
     # Group sample indices by original image ID
     groups = defaultdict(list)
     for idx, (img_path, _) in enumerate(full_dataset.samples):
@@ -389,9 +472,6 @@ def create_dataloaders(
     rng.shuffle(group_names)
 
     # Decide which groups go to train and which to val.
-    # Two-pass approach: accumulate groups into train until the target is reached,
-    # then put the remaining groups into val. All augmentations of a single
-    # source image always land in the same split, preventing data leakage.
     target_train_count = int(len(full_dataset) * train_split)
     cumulative = 0
     train_group_names = set()
@@ -401,7 +481,6 @@ def create_dataloaders(
         if cumulative < target_train_count:
             train_group_names.add(group_name)
             cumulative += group_size
-        # Once we've hit the target, remaining groups go to val automatically
 
     train_indices = []
     val_indices = []
@@ -414,7 +493,6 @@ def create_dataloaders(
 
     # Safety check: ensure val is not empty (edge case with very few groups)
     if not val_indices and train_indices:
-        # Move the last group from train to val
         last_group = group_names[-1]
         moved = groups[last_group]
         train_indices = [i for i in train_indices if i not in set(moved)]
@@ -438,18 +516,19 @@ def create_dataloaders(
 
     # Create DataLoaders
     use_pin_memory = torch.cuda.is_available()
+    effective_batch_size = min(batch_size, 16) if mode == "quick" else batch_size
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=effective_batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=use_pin_memory,
-        drop_last=True,
+        drop_last=(mode != "quick"),
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=effective_batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=use_pin_memory,
