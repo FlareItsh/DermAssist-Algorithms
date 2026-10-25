@@ -104,6 +104,9 @@ class SkinValidator:
             "a clinical photo of stasis dermatitis, leg eczema, or itchy red rash on ankle, foot, or lower leg",
             "a clinical macro photo of prurigo nodularis, excoriated firm itchy nodular bumps, or severely scratched pruritic lesions",
             "a clinical photo of cutaneous eczema with dry scaly lichenified erythematous eczema plaques",
+            "a photo of extensive red rash on arm, forearm, or inner arm with widespread erythematous bumps, papules, or dermatitis",
+            "a clinical photograph of widespread erythematous rash, allergic dermatitis, or maculopapular eczema rash covering the forearm or limbs",
+            "a close-up photo of widespread red papular dermatitis, eczema flare-up, or skin inflammation on arm or forearm",
         ]
 
         self._herpes_prompts: list[str] = [
@@ -176,8 +179,9 @@ class SkinValidator:
             "a clinical photograph of normal healthy cutaneous skin, intact epidermis, and healthy unblemished skin surface",
             "a close-up dermatological photograph of healthy normal human skin with intact cutaneous barrier and physiological texture",
             "a clinical macro photo of normal healthy human epidermis, physiological skin creases, and clear uninflamed skin texture",
-            "a clinical photograph of normal healthy skin on forearm, arm, or hand with intact epidermis and natural hair follicles",
-            "a close-up photo of an ankle, foot, heel, leg, arm, or hand with healthy clear unblemished skin",
+            "a clinical photograph of completely normal, clear, unblemished healthy skin on forearm, arm, or hand with no redness, no rash, no inflammation, and no bumps",
+            "a close-up photo of an ankle, foot, heel, leg, arm, or hand with completely clear, healthy, unblemished, uninflamed skin without any rash or spots",
+            "a close-up photo of clean healthy arm, wrist, or hand with flawless unblemished epidermis and no dermatological spots",
             "a close-up photo of jewelry, beads, or watch worn on healthy normal skin",
         ]
 
@@ -326,8 +330,8 @@ class SkinValidator:
         # 1. Non-skin objects, memes, animals
         if non_skin_score >= 0.35 and non_skin_score > lesion_score and non_skin_score > unsupported_score:
             winning_category = "non_skin"
-        # 2. Healthy unblemished skin / clear face (requires healthy_score >= 0.40 to beat lesion_score)
-        elif healthy_score >= 0.40 and healthy_score > lesion_score and healthy_score >= full_body_score and healthy_score > unsupported_score:
+        # 2. Healthy unblemished skin / clear face (requires healthy_score >= 0.55 and decisive margin over lesion_score)
+        elif healthy_score >= 0.55 and healthy_score > (lesion_score * 1.5) and healthy_score >= full_body_score and healthy_score > unsupported_score:
             winning_category = "healthy_skin"
         # 3. Distant full-body portraits, distant poses, clothing, and aesthetic procedures
         elif full_body_score >= 0.30 or (full_body_score >= 0.25 and full_body_score > lesion_score):
