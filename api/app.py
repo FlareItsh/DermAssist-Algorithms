@@ -27,6 +27,7 @@ from src.inference import SkinLesionPredictor, EnsemblePredictor
 from src.skin_validator import SkinValidator
 from src.image_quality import ImageQualityAssessor
 from src.training_manager import training_manager
+from src.bayesian_evaluator import BayesianClinicalEvaluator
 
 # Dynamic hardware acceleration
 GLOBAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -110,6 +111,28 @@ class HealthResponse(BaseModel):
 class ClassesResponse(BaseModel):
     classes: List[str]
     num_classes: int
+
+
+class QuestionnaireRefineRequest(BaseModel):
+    prior_probabilities: dict
+    answers: dict
+
+
+class QuestionnaireRefineResponse(BaseModel):
+    refined_probabilities: dict
+    refined_label: str
+    refined_confidence: float
+    visual_label: str
+    visual_confidence: float
+    delta_confidence: float
+    is_significant_shift: bool
+    clinical_evidence: List[str]
+    answers_recorded: dict
+
+
+class QuestionnaireSchemaRequest(BaseModel):
+    prior_probabilities: Optional[dict] = None
+    max_questions: Optional[int] = None
 
 
 # ---- Global Model Loading (Eager) ----
@@ -462,6 +485,48 @@ async def predict(file: UploadFile = File(...)):
         print(traceback.format_exc())
         print("!"*60 + "\n")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Bayesian Multimodal Refinement & Anamnesis Endpoints
+# ============================================================
+
+@app.get("/questionnaire/schema")
+def get_questionnaire_schema(max_questions: Optional[int] = None):
+    """Return all or dynamically prioritized clinical anamnesis questions."""
+    return {
+        "questions": BayesianClinicalEvaluator.get_dynamic_questions({}, max_questions=max_questions)
+    }
+
+
+@app.post("/questionnaire/schema")
+def post_questionnaire_schema(request: QuestionnaireSchemaRequest):
+    """Return dynamically prioritized clinical questions based on visual priors."""
+    priors = request.prior_probabilities or {}
+    return {
+        "questions": BayesianClinicalEvaluator.get_dynamic_questions(
+            priors, max_questions=request.max_questions
+        )
+    }
+
+
+@app.post("/diagnose/refine", response_model=QuestionnaireRefineResponse)
+def refine_diagnosis(request: QuestionnaireRefineRequest):
+    """
+    Refine visual diagnostic prediction using Bayesian symptom belief updating.
+    Integrates visual prior probabilities with literature-grounded symptom likelihoods.
+    """
+    try:
+        result = BayesianClinicalEvaluator.compute_posterior(
+            prior_probabilities=request.prior_probabilities,
+            answers=request.answers,
+        )
+        return QuestionnaireRefineResponse(**result)
+    except Exception as e:
+        import traceback
+        print(f"[API] ❌ Failed to compute Bayesian refinement: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=400, detail=f"Failed to compute refinement: {str(e)}")
 
 
 # ============================================================
