@@ -37,6 +37,7 @@ models/*_backup/
 # --- Training Artifacts ---
 training_history.png
 *.log
+scratch/
 
 # --- OS ---
 .DS_Store

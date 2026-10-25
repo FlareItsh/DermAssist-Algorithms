@@ -83,26 +83,42 @@ class SkinValidator:
         self._threshold: float = self._config.get("skin_confidence_threshold", 0.80)
 
         # Category-specific prompt suites
-        # Tier A: Target Conditions (Acne, Eczema, Herpes) — must describe genuine active inflammatory pathology
-        self._lesion_prompts: list[str] = [
-            # Acne
+        # Tier A: Target Conditions (Acne, Eczema, Herpes)
+        self._acne_prompts: list[str] = [
             "a clinical close-up macro photo of inflamed acne pimples, red pustules, whiteheads, blackheads, or acne zits",
             "a photo of inflammatory acne vulgaris breakout with red papules, pustules, or cystic lesions",
-            "a close-up photo of facial acne, comedones, or acne breakouts on face or chin",
-            # Eczema (Atopic, Dyshidrotic, Flexural, Lichenified, Periorbital)
+            "a close-up photo of facial acne, comedones, or acne breakouts on face, forehead, or chin",
+            "a clinical photo of severe cystic acne or nodulocystic acne breakout covering facial cheek and jawline with multiple inflamed lesions",
+            "a close-up photo of facial acne vulgaris with comedones, sebaceous plugs, follicular pustules, or acne breakouts on face",
+            "a clinical photograph of widespread pustular acne breakout on facial skin, cheek, chin, or jawline",
+        ]
+
+        self._eczema_prompts: list[str] = [
             "a close-up photo of hand eczema, finger dermatitis, cracked red scaly skin on knuckles or fingers",
             "a close-up photo of palm eczema, dyshidrotic eczema, pompholyx, red inflamed itchy skin on palm of hand",
             "a close-up photo of atopic eczema, flexural dermatitis with lichenification, excoriations, or dry scaly eczema in elbow or knee creases",
             "a photo of atopic dermatitis rash, eczema patches with fine flaking, itching, and excoriations",
             "a close-up photo of facial eczema, eyelid dermatitis, periorbital dermatitis, dry flaking scaly skin on eyelid or cheek",
-            "a photo of skin desquamation, peeling skin, exfoliative dermatitis, or shedding dry epidermal flakes",
-            # Herpes Simplex (Oral & Genital HSV-1 / HSV-2)
-            "a close-up photo of herpes simplex cold sores on lips, fever blisters, or clustered fluid-filled vesicles",
-            "a close-up photo of herpes sores, cutaneous herpes, or oral/genital vesicles on skin",
-            "a close-up photo of genital herpes, painful shallow ulcers, erosions, or clustered red herpes sores on genital or groin skin",
-            "a photo of herpes simplex virus infection, herpes lesions, vesicles, or mucosal erosions",
-            "a photo of herpes simplex, clustered fluid vesicles on inflamed skin",
+            "a clinical close-up photo of pathological skin desquamation, extensive peeling skin, exfoliative erythroderma, or shedding dry diseased epidermal flakes",
+            "a clinical photo of nummular eczema or discoid eczema with coin-shaped circular itchy red patches and crusting",
+            "a clinical photo of stasis dermatitis, leg eczema, or itchy red rash on ankle, foot, or lower leg",
+            "a clinical macro photo of prurigo nodularis, excoriated firm itchy nodular bumps, or severely scratched pruritic lesions",
+            "a clinical photo of cutaneous eczema with dry scaly lichenified erythematous eczema plaques",
         ]
+
+        self._herpes_prompts: list[str] = [
+            "a close-up macro photo of herpes simplex cold sores on lips, fever blisters, or tightly clustered fluid-filled water vesicles",
+            "a close-up photo of cutaneous herpes vesicles, grouped translucent fluid blisters on erythematous base, or crusted honey-colored sores",
+            "a close-up photo of genital herpes, painful shallow erosions, or tightly grouped viral vesicles on genital or groin skin",
+            "a clinical macro photo of herpes simplex virus infection, clustered small transparent water blisters on mucosal border or lips",
+            "a photo of herpes labialis, grouped fever blisters on lip margin with clear exudate",
+            "a clinical macro photo of herpes vesicles, grouped small fluid blisters on skin, or crusted herpes sores",
+            "a close-up photo of herpes simplex or herpes rash with clustered water blisters and erythematous base",
+        ]
+
+        self._lesion_prompts: list[str] = (
+            self._acne_prompts + self._eczema_prompts + self._herpes_prompts
+        )
 
         # Tier B: Out-of-Scope / Unsupported Conditions — non-target diseases
         # Each prompt maps to a concrete disease label via self._unsupported_prompt_labels
@@ -112,10 +128,10 @@ class SkinValidator:
             "a close-up photo of ringworm rash or circular tinea fungal infection on skin",
             "a photo of an itchy red ring on skin with distinct active circular borders",
             # Hives / Urticaria
-            "a photo of hives, acute urticaria, transient raised itchy edematous wheals, or swollen red allergic skin plaques",
-            "a photo of urticaria wheals, widespread allergic hives, dermatographia, or raised swollen itchy welts on skin",
-            "a photo of urticaria, hives rash, large pink erythematous wheals, or widespread allergic reaction on skin",
-            "a clinical photo of widespread urticarial plaques, hives on arm, or allergic wheals with irregular borders",
+            "a clinical photo of acute urticaria hives with large raised edematous wheals and swollen hive plaques",
+            "a clinical photo of urticaria wheals with prominent swollen edematous itchy hive welts",
+            "a clinical photograph of acute urticaria rash with raised erythematous wheals",
+            "a clinical photo of urticarial plaques with marked edema and swollen wheal borders",
             # Psoriasis
             "a photo of plaque psoriasis with well-demarcated thick plaques and silvery micaceous scales",
             "a photo of plaque psoriasis or guttate psoriasis with raised thick red scaly plaques on elbows or knees",
@@ -143,24 +159,38 @@ class SkinValidator:
             "melanoma",
         ]
 
-        # Tier C: Healthy Skin & Cosmetics
+        # Tier C: Healthy Skin, Clean Faces & Natural Epidermal Texture
         self._healthy_skin_prompts: list[str] = [
-            "a portrait or photo of a woman or person with clear healthy facial skin, beauty cosmetics, and no pimples",
-            "a close-up photo of a clean healthy face, flawless smooth skin, cosmetic makeup, and zero acne",
-            "a close-up photo of clean smooth healthy forehead, cheek, nose, or chin with no disease",
-            "a photograph of clean, smooth, healthy human skin with no disease, no rash, and no pimples",
+            # Clean Faces & Portraits
+            "a portrait photo or face photo of a person or woman with clear healthy skin, smiling, and glowing complexion",
+            "a headshot photo of a person with clear, healthy, unblemished facial skin and no lesions",
+            "a dermatological photograph of completely clear healthy skin on face",
+            "a close-up photograph of clean smooth healthy facial skin, forehead, or clear cheek",
+            "a photo of a person with beautiful clear skin and healthy radiant complexion",
+            "a close-up photo of clear healthy cheek and glowing smooth skin",
+            "a portrait or photo of a person with clear healthy facial skin, beauty cosmetics, and smooth complexion",
+            "a close-up photo of a clean healthy face, flawless smooth skin, and clear complexion",
+            # Macro Skin & Natural Texture
+            "a clinical close-up macro photograph of completely normal healthy human skin, clear intact epidermis, and physiological skin texture",
+            "a clinical dermatological photograph of normal healthy skin with intact epidermal barrier, physiological skin lines, and clear skin appearance",
+            "a clinical photograph of normal healthy cutaneous skin, intact epidermis, and healthy unblemished skin surface",
+            "a close-up dermatological photograph of healthy normal human skin with intact cutaneous barrier and physiological texture",
+            "a clinical macro photo of normal healthy human epidermis, physiological skin creases, and clear uninflamed skin texture",
+            "a clinical photograph of normal healthy skin on forearm, arm, or hand with intact epidermis and natural hair follicles",
             "a close-up photo of an ankle, foot, heel, leg, arm, or hand with healthy clear unblemished skin",
             "a close-up photo of jewelry, beads, or watch worn on healthy normal skin",
         ]
 
-        # Tier D: Full Body, Headshot Portraits & Aesthetic Procedures
+        # Tier D: Distant Full Body, Distant Poses & Aesthetic Procedures
         self._full_body_prompts: list[str] = [
-            "a headshot portrait photo of a person or model posing, smiling, or looking at camera",
-            "a photo of a dermatologist or aesthetician examining or treating a patient's face with a handheld light, device, or dermatoscope",
-            "a beauty clinic, cosmetic spa treatment, or facial aesthetic procedure photo",
-            "a distant body photograph or portrait without a close-up lesion",
-            "a full body photo of a person or model lying down, standing, or posing",
-            "a full body photo of a person lying on a bed, mattress, or blue sheet",
+            "a distant full body or half body photo of a person standing, sitting, or posing with clothes visible",
+            "a portrait photo of a person wearing a sweater, shirt, clothing, or collar, posing with hands or arms raised",
+            "a portrait photo of a person with hands raised, gesturing, waving, or showing hands in front of body",
+            "a distant body photograph, waist-up portrait, or wide shot without a close-up skin lesion",
+            "a distant selfie photograph of an individual posing with clothes visible",
+            "a full body photo of a person standing or sitting in a room",
+            "a photo of a dermatologist or aesthetician examining or treating a patient with a handheld light, device, or dermatoscope",
+            "a beauty clinic, cosmetic spa treatment, or aesthetic procedure photo",
         ]
 
         # Tier E: Non-Skin / Objects / Memes
@@ -190,7 +220,7 @@ class SkinValidator:
             + self._non_skin_prompts
         )
 
-        print(f"[SkinValidator] ⏳ Loading CLIP model: {model_name}")
+        print(f"[SkinValidator] Loading CLIP model: {model_name}")
 
         # Determine device — prefer GPU, fall back to CPU
         if torch.cuda.is_available():
@@ -202,7 +232,7 @@ class SkinValidator:
         self._model = CLIPModel.from_pretrained(model_name).to(self._device)
         self._model.eval()
 
-        print(f"[SkinValidator] ✅ Multi-Category Semantic Gate loaded on {self._device} "
+        print(f"[SkinValidator] Multi-Category Semantic Gate loaded on {self._device} "
               f"({len(self._all_prompts)} prompts across 5 clinical tiers)")
 
     # ------------------------------------------------------------------
@@ -275,18 +305,35 @@ class SkinValidator:
         full_body_score = category_scores.get("full_body_portrait", 0.0)
         non_skin_score = category_scores.get("non_skin", 0.0)
 
+        # Specific semantic affinity across in-scope target diseases
+        acne_count = len(self._acne_prompts)
+        eczema_count = len(self._eczema_prompts)
+        herpes_count = len(self._herpes_prompts)
+
+        acne_max_logit = logits[0, 0: acne_count].max().item()
+        eczema_max_logit = logits[0, acne_count: acne_count + eczema_count].max().item()
+        herpes_max_logit = logits[0, acne_count + eczema_count: len(self._lesion_prompts)].max().item()
+
+        in_scope_tensor = torch.tensor([acne_max_logit, eczema_max_logit, herpes_max_logit], device=self._device)
+        in_scope_probs = torch.softmax(in_scope_tensor / 0.7, dim=0)
+        semantic_affinity = {
+            "acne": round(in_scope_probs[0].item(), 4),
+            "eczema": round(in_scope_probs[1].item(), 4),
+            "herpes": round(in_scope_probs[2].item(), 4),
+        }
+
         # ---- Clinical Priority Decision Rules ----
         # 1. Non-skin objects, memes, animals
         if non_skin_score >= 0.35 and non_skin_score > lesion_score and non_skin_score > unsupported_score:
             winning_category = "non_skin"
-        # 2. Distant full-body portraits, headshots, and aesthetic procedures
-        elif full_body_score >= 0.35 and full_body_score > lesion_score and full_body_score > unsupported_score:
-            winning_category = "full_body_portrait"
-        # 3. Healthy unblemished skin / cosmetic face without active disease
-        elif healthy_score >= 0.35 and healthy_score > lesion_score and healthy_score > unsupported_score:
+        # 2. Healthy unblemished skin / clear face (requires healthy_score >= 0.40 to beat lesion_score)
+        elif healthy_score >= 0.40 and healthy_score > lesion_score and healthy_score >= full_body_score and healthy_score > unsupported_score:
             winning_category = "healthy_skin"
-        # 4. Out-of-Scope Condition (unsupported condition beats lesion score or is within close margin)
-        elif unsupported_score >= 0.35 and unsupported_score >= (lesion_score - 0.05):
+        # 3. Distant full-body portraits, distant poses, clothing, and aesthetic procedures
+        elif full_body_score >= 0.30 or (full_body_score >= 0.25 and full_body_score > lesion_score):
+            winning_category = "full_body_portrait"
+        # 4. Out-of-Scope Condition (unsupported condition strictly beats lesion score with clear margin)
+        elif unsupported_score >= 0.50 and unsupported_score > (lesion_score + 0.05):
             winning_category = "unsupported_condition"
         # 5. Default to Target Lesion (allows Acne, Eczema, Herpes to pass freely to classifier)
         else:
@@ -353,6 +400,7 @@ class SkinValidator:
             "image_type": image_type,
             "skin_score": round(lesion_score + unsupported_score + healthy_score, 4),
             "category_scores": category_scores,
+            "semantic_affinity": semantic_affinity,
             "out_of_scope_category": out_of_scope_category,
             "reason": reason,
         }

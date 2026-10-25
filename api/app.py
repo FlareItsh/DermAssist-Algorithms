@@ -183,11 +183,21 @@ def init_predictor_sync():
 predictor = init_predictor_sync()
 
 def reload_predictor():
-    """Reload predictor with newly trained weights."""
-    global predictor
+    """Reload predictor with newly trained weights and update skin validator."""
+    global predictor, skin_validator
     print("\n[API] 🔄 Hot-reloading AI model predictor into memory...")
     try:
         predictor = init_predictor_sync()
+        try:
+            import importlib
+            import src.skin_validator
+            importlib.reload(src.skin_validator)
+            with open("config.yaml", "r") as _f:
+                _cfg = yaml.safe_load(_f)
+            skin_validator = src.skin_validator.SkinValidator(_cfg)
+            print("[API] 🔄 Reloaded SkinValidator.")
+        except Exception as _ve:
+            print(f"[API] ⚠ Failed to reload SkinValidator: {_ve}")
         return predictor is not None
     except Exception as e:
         print(f"[API] ❌ Failed to reload predictor: {e}")
@@ -386,14 +396,41 @@ async def predict(file: UploadFile = File(...)):
         # ---- Inconclusive & Low Confidence Safety Guard ----
         raw_label = result["label"]
         raw_conf = result["confidence"]
-        all_probs = result["all_probabilities"]
+        all_probs = dict(result["all_probabilities"])
+
+        # ---- Anatomical & Morphological Prior Calibration ----
+        semantic_affinity = validation.get("semantic_affinity", {}) if validation else {}
+        acne_aff = semantic_affinity.get("acne", 0.0)
+        eczema_aff = semantic_affinity.get("eczema", 0.0)
+        herpes_aff = semantic_affinity.get("herpes", 0.0)
+
+        # 1. Disentangle Pustules vs Vesicles on Facial Acne:
+        # If classifier predicted Herpes, but semantic affinity strongly indicates follicular/cystic acne
+        # on cheek/jawline (acne_aff >= 0.65) while vesicular herpes affinity is low (< 0.15):
+        if raw_label == "Herpes" and acne_aff >= 0.65 and herpes_aff < 0.15:
+            print(f"[Anatomical Heuristic] Overriding Herpes -> Acne (acne_aff={acne_aff:.3f} > herpes_aff={herpes_aff:.3f})")
+            transfer = all_probs.get("Herpes", 0.0) * 0.75
+            all_probs["Acne"] = all_probs.get("Acne", 0.0) + transfer
+            all_probs["Herpes"] = all_probs.get("Herpes", 0.0) - transfer
+            prob_sum = sum(all_probs.values())
+            if prob_sum > 0:
+                all_probs = {k: round(v / prob_sum, 4) for k, v in all_probs.items()}
+            raw_label = max(all_probs, key=lambda k: all_probs[k])
+            raw_conf = all_probs[raw_label]
+
+        # 2. Non-Vesicular Neck/Trunk Herpes Guard:
+        # Herpes requires clustered fluid vesicles. If Herpes was predicted on a diffuse non-vesicular rash
+        # where Herpes affinity is near zero (< 0.08): safely route to Inconclusive rather than misdiagnosing
+        elif raw_label == "Herpes" and herpes_aff < 0.08:
+            print(f"[Anatomical Heuristic] Non-vesicular rash detected; routing Herpes -> Inconclusive (herpes_aff={herpes_aff:.3f})")
+            raw_label = "Inconclusive"
 
         # Sort probability values descending
         sorted_probs = sorted(all_probs.values(), reverse=True)
         top_margin = (sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else sorted_probs[0]
 
         # Guard triggers only if top class confidence is extremely low (< 45%) or distribution is completely flat (top margin < 5%)
-        is_inconclusive = (raw_conf < 0.45) or (top_margin < 0.05)
+        is_inconclusive = (raw_label == "Inconclusive") or (raw_conf < 0.45) or (top_margin < 0.05)
 
         if is_inconclusive:
             final_label = "Inconclusive"
@@ -421,7 +458,7 @@ async def predict(file: UploadFile = File(...)):
     except Exception as e:
         import traceback
         print("\n" + "!"*60)
-        print(" ❌ PREDICTION CRASH:")
+        print(" [ERROR] PREDICTION CRASH:")
         print(traceback.format_exc())
         print("!"*60 + "\n")
         raise HTTPException(status_code=500, detail=str(e))
