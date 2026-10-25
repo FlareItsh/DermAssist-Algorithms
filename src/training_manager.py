@@ -1025,7 +1025,13 @@ class TrainingManager:
                     self.log(f"✅ PASSED GUARD: {arch.upper()} improved {guard_scope} ({baseline_acc:.2f}% -> {candidate_acc:.2f}%).")
                     if os.path.exists(target_prod_path):
                         shutil.copy2(target_prod_path, backup_prod_path)
-                    torch.save(new_best_model_weights, target_prod_path)
+                    
+                    # Production weights are stripped of optimizer_state_dict to remain lightweight (<100MB)
+                    prod_weights = {
+                        k: v for k, v in new_best_model_weights.items()
+                        if k != "optimizer_state_dict"
+                    }
+                    torch.save(prod_weights, target_prod_path)
                     if expansion_disease:
                         checkpoints_4class_dir = "models/checkpoints_4class"
                         os.makedirs(checkpoints_4class_dir, exist_ok=True)

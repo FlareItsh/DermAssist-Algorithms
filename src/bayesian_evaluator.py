@@ -291,22 +291,30 @@ class BayesianClinicalEvaluator:
         else:
             target_count = 6  # Ambiguous / close competition: 6 questions
 
-        # Score questions by Mutual Information / Information Divergence between d1 and d2
+        # Score questions across all 3 primary in-scope diseases (Acne, Eczema, Herpes)
+        # to ensure that runner-up or third-place conditions are not blind-spotted
+        all_core_diseases = ["Acne", "Eczema", "Herpes"]
         scored_questions = []
         for q_id, q_data in cls.SYMPTOM_LIKELIHOODS.items():
             divergence = 0.0
             for opt_id, opt_info in q_data["options"].items():
                 if opt_id == "unsure":
                     continue
-                p_d1 = opt_info["likelihoods"].get(d1, 0.3333)
-                p_d2 = opt_info["likelihoods"].get(d2, 0.3333)
-                # Absolute log likelihood ratio contribution
-                ratio = math.fabs(math.log(max(p_d1, 0.01) / max(p_d2, 0.01)))
-                divergence += ratio
+                # Calculate pairwise log-likelihood divergence across all disease pairs
+                for i in range(len(all_core_diseases)):
+                    for j in range(i + 1, len(all_core_diseases)):
+                        p_di = opt_info["likelihoods"].get(all_core_diseases[i], 0.3333)
+                        p_dj = opt_info["likelihoods"].get(all_core_diseases[j], 0.3333)
+                        divergence += math.fabs(math.log(max(p_di, 0.01) / max(p_dj, 0.01)))
+
+            # Clinically indispensable dimensions: Body Location and Lesion Texture
+            # receive priority anchoring so patients can always specify where and what the lesion looks like
+            if q_id in ("distribution", "texture"):
+                divergence += 15.0
 
             scored_questions.append((q_id, divergence, q_data))
 
-        # Sort descending by discriminative power between top two candidates
+        # Sort descending by discriminative power across all classes
         scored_questions.sort(key=lambda x: x[1], reverse=True)
 
         selected = []
@@ -333,7 +341,7 @@ class BayesianClinicalEvaluator:
         cls,
         prior_probabilities: Dict[str, float],
         answers: Dict[str, str],
-        epsilon: float = 0.01,
+        epsilon: float = 0.03,
     ) -> Dict[str, Any]:
         """
         Computes posterior probabilities via Bayes' rule in log-space.
@@ -342,7 +350,7 @@ class BayesianClinicalEvaluator:
         Args:
             prior_probabilities: Dict mapping disease name to visual softmax probability.
             answers: Dict mapping question dimension ID (e.g. 'sensation') to chosen option ID.
-            epsilon: Laplace smoothing floor to prevent log(0).
+            epsilon: Laplace smoothing floor to prevent log(0) and enable recovery of suppressed classes.
 
         Returns:
             Dictionary containing:
@@ -358,12 +366,17 @@ class BayesianClinicalEvaluator:
         if not prior_probabilities:
             prior_probabilities = {"Acne": 0.3333, "Eczema": 0.3333, "Herpes": 0.3333}
 
-        # Normalize priors if needed
+        # Normalize priors if needed, enforcing minimum prior floor epsilon
         prior_sum = sum(prior_probabilities.values())
         if prior_sum > 0:
             norm_priors = {k: max(v / prior_sum, epsilon) for k, v in prior_probabilities.items()}
         else:
             norm_priors = {k: 1.0 / len(prior_probabilities) for k in prior_probabilities}
+
+        # Ensure all 3 core in-scope diseases are present in norm_priors with at least epsilon
+        for core_d in ["Acne", "Eczema", "Herpes"]:
+            if core_d not in norm_priors or norm_priors[core_d] < epsilon:
+                norm_priors[core_d] = epsilon
 
         diseases = list(norm_priors.keys())
         log_posteriors: Dict[str, float] = {d: math.log(norm_priors[d]) for d in diseases}

@@ -56,6 +56,19 @@ class TestBayesianClinicalEvaluator(unittest.TestCase):
         q_ambig = BayesianClinicalEvaluator.get_dynamic_questions(ambig_priors)
         self.assertEqual(len(q_ambig), 6)
 
+    def test_severe_visual_misdiagnosis_recovery(self):
+        # Severe real-world case: visual model predicted Acne 96%, Herpes 0.8% on a cold sore
+        priors = {"Acne": 0.96, "Eczema": 0.02, "Herpes": 0.008}
+        answers = {
+            "distribution": "lips_vermilion_mucosa",
+            "texture": "clustered_blisters",
+            "sensation": "burning_tingling",
+        }
+        result = BayesianClinicalEvaluator.compute_posterior(priors, answers)
+        self.assertEqual(result["refined_label"], "Herpes")
+        self.assertGreater(result["refined_confidence"], 0.95)
+        self.assertTrue(result["is_significant_shift"])
+
 
 if __name__ == "__main__":
     unittest.main()
