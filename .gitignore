@@ -29,9 +29,13 @@ data/processed/*
 data/test/*
 data/results/*
 data/*_Backup/
+data/
 models/checkpoints/*
-models/production/*.pth
-models/*_backup/
+models/*backup*/
+models/production/*.tmp
+!models/
+!models/production/
+!models/production/*.pth
 !**/.gitkeep
 
 # --- Training Artifacts ---
@@ -42,10 +46,6 @@ scratch/
 # --- OS ---
 .DS_Store
 Thumbs.db
-
-models/
-
-data/
 
 # --- AI Assistant Configs ---
 .agents/
