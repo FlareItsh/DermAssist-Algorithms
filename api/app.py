@@ -27,6 +27,10 @@ from src.inference import SkinLesionPredictor, EnsemblePredictor
 from src.skin_validator import SkinValidator
 from src.image_quality import ImageQualityAssessor
 from src.training_manager import training_manager
+from src.bayesian_evaluator import BayesianClinicalEvaluator
+
+# Dynamic hardware acceleration
+GLOBAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ============================================================
 # Schemas
@@ -38,11 +42,16 @@ class StartTrainingRequest(BaseModel):
     sync_dataset: Optional[bool] = True
     learning_rate: Optional[float] = None
     expansion_disease: Optional[str] = None
+    training_mode: Optional[str] = "quick"
+    fresh_start: Optional[bool] = False
+    active_image_files: Optional[List[str]] = None
 
 class TrainingStatusResponse(BaseModel):
     status: str
     progress: float
     architecture: str
+    training_mode: Optional[str] = "quick"
+    fresh_start: Optional[bool] = False
     current_epoch: int
     total_epochs: int
     current_batch: int
@@ -104,6 +113,28 @@ class ClassesResponse(BaseModel):
     num_classes: int
 
 
+class QuestionnaireRefineRequest(BaseModel):
+    prior_probabilities: dict
+    answers: dict
+
+
+class QuestionnaireRefineResponse(BaseModel):
+    refined_probabilities: dict
+    refined_label: str
+    refined_confidence: float
+    visual_label: str
+    visual_confidence: float
+    delta_confidence: float
+    is_significant_shift: bool
+    clinical_evidence: List[str]
+    answers_recorded: dict
+
+
+class QuestionnaireSchemaRequest(BaseModel):
+    prior_probabilities: Optional[dict] = None
+    max_questions: Optional[int] = None
+
+
 # ---- Global Model Loading (Eager) ----
 print("\n" + "="*60)
 print(" 🚀 DERMASSIST AI: EAGER LOADING STARTING...")
@@ -130,7 +161,7 @@ def init_predictor_sync():
         ensemble_enabled = config["inference"].get("ensemble_enabled", False)
         
         if ensemble_enabled:
-            print(f"[API] ⏳ LOADING ENSEMBLE MODEL")
+            print(f"[API] ⏳ LOADING ENSEMBLE MODEL (Device: {GLOBAL_DEVICE.upper()})")
             model_paths_and_archs = [
                 ("models/production/best_model_resnet50.pth", "resnet50"),
                 ("models/production/best_model_efficientnet_v2.pth", "efficientnet_v2"),
@@ -139,7 +170,7 @@ def init_predictor_sync():
             predictor = EnsemblePredictor(
                 model_paths_and_archs=model_paths_and_archs,
                 config=config,
-                device="cpu",
+                device=GLOBAL_DEVICE,
             )
         else:
             # Check if model exists
@@ -151,12 +182,12 @@ def init_predictor_sync():
                     print(f"[API] ⚠ WARNING: No model found at {model_path}. Predict endpoint will be disabled.")
                     return None
 
-            print(f"[API] ⏳ LOADING MODEL: {active_arch.upper()} from {model_path}")
+            print(f"[API] ⏳ LOADING MODEL: {active_arch.upper()} from {model_path} (Device: {GLOBAL_DEVICE.upper()})")
             
             predictor = SkinLesionPredictor(
                 model_path=model_path,
                 config=config,
-                device="cpu", 
+                device=GLOBAL_DEVICE, 
                 architecture=active_arch
             )
         
@@ -175,11 +206,21 @@ def init_predictor_sync():
 predictor = init_predictor_sync()
 
 def reload_predictor():
-    """Reload predictor with newly trained weights."""
-    global predictor
+    """Reload predictor with newly trained weights and update skin validator."""
+    global predictor, skin_validator
     print("\n[API] 🔄 Hot-reloading AI model predictor into memory...")
     try:
         predictor = init_predictor_sync()
+        try:
+            import importlib
+            import src.skin_validator
+            importlib.reload(src.skin_validator)
+            with open("config.yaml", "r") as _f:
+                _cfg = yaml.safe_load(_f)
+            skin_validator = src.skin_validator.SkinValidator(_cfg)
+            print("[API] 🔄 Reloaded SkinValidator.")
+        except Exception as _ve:
+            print(f"[API] ⚠ Failed to reload SkinValidator: {_ve}")
         return predictor is not None
     except Exception as e:
         print(f"[API] ❌ Failed to reload predictor: {e}")
@@ -297,7 +338,7 @@ async def predict(file: UploadFile = File(...)):
                     label="None",
                     confidence=1.0,
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type="non_skin",
                     image_quality=image_quality,
@@ -314,7 +355,7 @@ async def predict(file: UploadFile = File(...)):
                     label="None",
                     confidence=1.0,
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type="full_body_portrait",
                     image_quality=image_quality,
@@ -331,7 +372,7 @@ async def predict(file: UploadFile = File(...)):
                     label="Clear",
                     confidence=0.98,
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type=image_type,
                     image_quality=image_quality,
@@ -350,7 +391,7 @@ async def predict(file: UploadFile = File(...)):
                     label="Inconclusive",
                     confidence=round(unsupported_conf, 4),
                     all_probabilities={"Acne": 0.0, "Eczema": 0.0, "Herpes": 0.0},
-                    device="cpu",
+                    device=GLOBAL_DEVICE,
                     architecture="clip",
                     image_type=image_type,
                     image_quality=image_quality,
@@ -358,6 +399,7 @@ async def predict(file: UploadFile = File(...)):
                     clinical_feedback="This condition appears to be outside our 3 primary focus areas (Acne, Eczema, Herpes). It may represent an unsupported skin condition (such as Psoriasis, Ringworm, or other lesion). Please consult a licensed dermatologist for comprehensive clinical evaluation.",
                     out_of_scope_category=out_of_scope_cat,
                 )
+
 
         # ---- Image quality assessment (metadata only — image unchanged) ----
         # Runs on the same temp file BEFORE the predictor so we can clean up
@@ -377,14 +419,41 @@ async def predict(file: UploadFile = File(...)):
         # ---- Inconclusive & Low Confidence Safety Guard ----
         raw_label = result["label"]
         raw_conf = result["confidence"]
-        all_probs = result["all_probabilities"]
+        all_probs = dict(result["all_probabilities"])
+
+        # ---- Anatomical & Morphological Prior Calibration ----
+        semantic_affinity = validation.get("semantic_affinity", {}) if validation else {}
+        acne_aff = semantic_affinity.get("acne", 0.0)
+        eczema_aff = semantic_affinity.get("eczema", 0.0)
+        herpes_aff = semantic_affinity.get("herpes", 0.0)
+
+        # 1. Disentangle Pustules vs Vesicles on Facial Acne:
+        # If classifier predicted Herpes, but semantic affinity strongly indicates follicular/cystic acne
+        # on cheek/jawline (acne_aff >= 0.65) while vesicular herpes affinity is low (< 0.15):
+        if raw_label == "Herpes" and acne_aff >= 0.65 and herpes_aff < 0.15:
+            print(f"[Anatomical Heuristic] Overriding Herpes -> Acne (acne_aff={acne_aff:.3f} > herpes_aff={herpes_aff:.3f})")
+            transfer = all_probs.get("Herpes", 0.0) * 0.75
+            all_probs["Acne"] = all_probs.get("Acne", 0.0) + transfer
+            all_probs["Herpes"] = all_probs.get("Herpes", 0.0) - transfer
+            prob_sum = sum(all_probs.values())
+            if prob_sum > 0:
+                all_probs = {k: round(v / prob_sum, 4) for k, v in all_probs.items()}
+            raw_label = max(all_probs, key=lambda k: all_probs[k])
+            raw_conf = all_probs[raw_label]
+
+        # 2. Non-Vesicular Neck/Trunk Herpes Guard:
+        # Herpes requires clustered fluid vesicles. If Herpes was predicted on a diffuse non-vesicular rash
+        # where Herpes affinity is near zero (< 0.08): safely route to Inconclusive rather than misdiagnosing
+        elif raw_label == "Herpes" and herpes_aff < 0.08:
+            print(f"[Anatomical Heuristic] Non-vesicular rash detected; routing Herpes -> Inconclusive (herpes_aff={herpes_aff:.3f})")
+            raw_label = "Inconclusive"
 
         # Sort probability values descending
         sorted_probs = sorted(all_probs.values(), reverse=True)
         top_margin = (sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else sorted_probs[0]
 
         # Guard triggers only if top class confidence is extremely low (< 45%) or distribution is completely flat (top margin < 5%)
-        is_inconclusive = (raw_conf < 0.45) or (top_margin < 0.05)
+        is_inconclusive = (raw_label == "Inconclusive") or (raw_conf < 0.45) or (top_margin < 0.05)
 
         if is_inconclusive:
             final_label = "Inconclusive"
@@ -412,10 +481,52 @@ async def predict(file: UploadFile = File(...)):
     except Exception as e:
         import traceback
         print("\n" + "!"*60)
-        print(" ❌ PREDICTION CRASH:")
+        print(" [ERROR] PREDICTION CRASH:")
         print(traceback.format_exc())
         print("!"*60 + "\n")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Bayesian Multimodal Refinement & Anamnesis Endpoints
+# ============================================================
+
+@app.get("/questionnaire/schema")
+def get_questionnaire_schema(max_questions: Optional[int] = None):
+    """Return all or dynamically prioritized clinical anamnesis questions."""
+    return {
+        "questions": BayesianClinicalEvaluator.get_dynamic_questions({}, max_questions=max_questions)
+    }
+
+
+@app.post("/questionnaire/schema")
+def post_questionnaire_schema(request: QuestionnaireSchemaRequest):
+    """Return dynamically prioritized clinical questions based on visual priors."""
+    priors = request.prior_probabilities or {}
+    return {
+        "questions": BayesianClinicalEvaluator.get_dynamic_questions(
+            priors, max_questions=request.max_questions
+        )
+    }
+
+
+@app.post("/diagnose/refine", response_model=QuestionnaireRefineResponse)
+def refine_diagnosis(request: QuestionnaireRefineRequest):
+    """
+    Refine visual diagnostic prediction using Bayesian symptom belief updating.
+    Integrates visual prior probabilities with literature-grounded symptom likelihoods.
+    """
+    try:
+        result = BayesianClinicalEvaluator.compute_posterior(
+            prior_probabilities=request.prior_probabilities,
+            answers=request.answers,
+        )
+        return QuestionnaireRefineResponse(**result)
+    except Exception as e:
+        import traceback
+        print(f"[API] ❌ Failed to compute Bayesian refinement: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=400, detail=f"Failed to compute refinement: {str(e)}")
 
 
 # ============================================================
@@ -431,16 +542,23 @@ def start_training(request: StartTrainingRequest):
         sync_dataset=request.sync_dataset if request.sync_dataset is not None else True,
         learning_rate=request.learning_rate,
         expansion_disease=request.expansion_disease,
+        training_mode=request.training_mode or "quick",
+        fresh_start=request.fresh_start or False,
+        active_image_files=request.active_image_files,
     )
     if not success:
         error_msg = getattr(training_manager, "last_start_error", None) or "A training session is already in progress."
         status_code = 422 if "Insufficient" in error_msg else 409
         raise HTTPException(status_code=status_code, detail=error_msg)
 
-    desc = f"Expansion training for {request.expansion_disease.title()}" if request.expansion_disease else f"Retraining started for {request.architecture or 'ensemble'}"
+    mode_label = "⚡ Rapid Quick-Tune" if (request.training_mode or "quick") == "quick" else "🔄 Full Retrain"
+    fresh_label = " (Fresh Start)" if request.fresh_start else ""
+    desc = f"Expansion training for {request.expansion_disease.title()}" if request.expansion_disease else f"{mode_label}{fresh_label} started for {request.architecture or 'ensemble'}"
     return {
         "message": desc,
         "status": "started",
+        "training_mode": request.training_mode or "quick",
+        "fresh_start": request.fresh_start or False,
         "epochs": request.epochs or 5,
         "expansion_disease": request.expansion_disease,
     }
@@ -457,6 +575,9 @@ def cancel_training():
     """Cancel current training session safely."""
     success = training_manager.cancel_training()
     if not success:
+        current_status = training_manager.get_status().get("status")
+        if current_status in ["cancelling", "cancelled", "idle", "completed", "failed"]:
+            return {"message": "Training is not actively running.", "status": current_status}
         raise HTTPException(status_code=400, detail="No active training session to cancel.")
     return {"message": "Cancellation request submitted.", "status": "cancelling"}
 
@@ -481,6 +602,19 @@ def trigger_reload():
     if not success:
         raise HTTPException(status_code=500, detail="Failed to reload model predictor.")
     return {"message": "Model predictor reloaded successfully.", "status": "ready"}
+
+
+class RollbackRequest(BaseModel):
+    architecture: Optional[str] = "ensemble"
+
+
+@app.post("/model/rollback", response_model=dict)
+def rollback_model_endpoint(request: RollbackRequest = RollbackRequest()):
+    """Roll back active model weights to previous backup checkpoint."""
+    res = training_manager.rollback_model(architecture=request.architecture or "ensemble")
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
 
 
 if __name__ == "__main__":

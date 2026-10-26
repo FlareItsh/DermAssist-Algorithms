@@ -43,6 +43,7 @@ data:
     - 0.456
     - 0.406
   num_workers: 0
+  holdout_test_dir: data/holdout_test
   processed_dir: data/processed
   raw_dir: data/raw
   std:
