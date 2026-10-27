@@ -63,12 +63,12 @@ class SkinLesionPredictor:
             self.device = torch.device(device)
 
         # ---- Load checkpoint ----
-        print(f"[Inference] Loading model from: {model_path}")
+        print(f"[Inference] Loading model from: {model_path} (map_location={self.device})")
         checkpoint = torch.load(model_path, map_location=self.device)
 
         # ---- Extract class names ----
         # Try checkpoint first, fall back to config
-        if "class_names" in checkpoint:
+        if isinstance(checkpoint, dict) and "class_names" in checkpoint:
             self.class_names = checkpoint["class_names"]
         else:
             self.class_names = config["model"]["class_names"]
@@ -78,7 +78,7 @@ class SkinLesionPredictor:
         # ---- Build model and load weights ----
         # Priority: Checkpoint > Manual Override (architecture param) > Config
         arch = architecture
-        if "architecture" in checkpoint:
+        if isinstance(checkpoint, dict) and "architecture" in checkpoint:
             arch = checkpoint["architecture"]
         
         self.architecture = arch
@@ -90,7 +90,7 @@ class SkinLesionPredictor:
             architecture=arch
         )
         # ---- Deep Weight Mapping (Legacy Fix) ----
-        state_dict = checkpoint["model_state_dict"]
+        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         new_state_dict = {}
         
         # If the model has 'classifier' but checkpoint has 'backbone.fc', we bridge them

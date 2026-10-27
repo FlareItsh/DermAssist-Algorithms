@@ -236,8 +236,20 @@ class SkinValidator:
         self._model = CLIPModel.from_pretrained(model_name).to(self._device)
         self._model.eval()
 
+        # Pre-compute and cache normalized text embeddings for all static prompts
+        print(f"[SkinValidator] Pre-computing static embeddings for {len(self._all_prompts)} prompts...")
+        text_inputs = self._processor(
+            text=self._all_prompts,
+            return_tensors="pt",
+            padding=True,
+        ).to(self._device)
+        with torch.no_grad():
+            text_out = self._model.get_text_features(**text_inputs)
+            text_embeds = text_out.pooler_output if hasattr(text_out, "pooler_output") and text_out.pooler_output is not None else (text_out if isinstance(text_out, torch.Tensor) else text_out[0])
+            self._text_features = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+
         print(f"[SkinValidator] Multi-Category Semantic Gate loaded on {self._device} "
-              f"({len(self._all_prompts)} prompts across 5 clinical tiers)")
+              f"({len(self._all_prompts)} prompts pre-cached across 5 clinical tiers)")
 
     # ------------------------------------------------------------------
     # Public API
@@ -274,17 +286,18 @@ class SkinValidator:
         elif image.mode != "RGB":
             image = image.convert("RGB")
 
-        # ---- Run CLIP ----
-        inputs = self._processor(
-            text=self._all_prompts,
+        # ---- Run CLIP (Image-only with cached static text features) ----
+        image_inputs = self._processor(
             images=image,
             return_tensors="pt",
-            padding=True,
         ).to(self._device)
 
         with torch.no_grad():
-            outputs = self._model(**inputs)
-            logits = outputs.logits_per_image
+            img_out = self._model.get_image_features(**image_inputs)
+            img_embeds = img_out.pooler_output if hasattr(img_out, "pooler_output") and img_out.pooler_output is not None else (img_out if isinstance(img_out, torch.Tensor) else img_out[0])
+            img_features = img_embeds / img_embeds.norm(dim=-1, keepdim=True)
+            logit_scale = self._model.logit_scale.exp()
+            logits = logit_scale * (img_features @ self._text_features.T)
             probs = logits.softmax(dim=1)[0]
 
         # ---- Category Logit Pooling & Temperature Softmax ----
