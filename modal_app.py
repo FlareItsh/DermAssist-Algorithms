@@ -65,9 +65,9 @@ volume = modal.Volume.from_name("dermassist-models", create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu=None,  # CPU-only (no credit card required). Set to "T4" once payment method is added.
+    gpu="T4",  # NVIDIA T4 (16GB) — Cheapest GPU on Modal ($0.59/hr, billed per-second)
     timeout=600,  # 10 min timeout for retraining jobs
-    scaledown_window=60,  # Automatically scale down to 0 after 60s idle ($0 idle cost)
+    scaledown_window=300,  # Automatically scale down to 0 after 5 min idle ($0 idle cost)
     volumes={"/root/algorithms/models/checkpoints": volume},
 )
 @modal.asgi_app()
