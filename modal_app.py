@@ -45,20 +45,30 @@ image = (
     .add_local_dir(
         os.path.dirname(os.path.abspath(__file__)),
         remote_path="/root/algorithms",
-        ignore=["venv", "__pycache__", ".git", "scratch", "*.log", "data/test"],
+        ignore=[
+            "venv",
+            "__pycache__",
+            ".git",
+            "scratch",
+            "*.log",
+            "data",
+            "models/checkpoints",
+            "models/checkpoints_*",
+            "*.png",
+        ],
     )
 )
 
-# Optional volume for persisting retrained checkpoints across runs
+# Volume for persisting retrained checkpoints across runs
 volume = modal.Volume.from_name("dermassist-models", create_if_missing=True)
 
 
 @app.function(
     image=image,
-    gpu="T4",  # High-speed GPU inference. Set to None for CPU-only.
+    gpu="T4",  # NVIDIA T4 (16GB) — Cheapest GPU on Modal ($0.59/hr, billed per-second)
     timeout=600,  # 10 min timeout for retraining jobs
-    scaledown_window=60,  # Automatically scale down to 0 after 60s idle ($0 idle cost)
-    volumes={"/root/algorithms/models": volume},
+    scaledown_window=300,  # Automatically scale down to 0 after 5 min idle ($0 idle cost)
+    volumes={"/root/algorithms/models/checkpoints": volume},
 )
 @modal.asgi_app()
 def fastapi_app():

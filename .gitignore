@@ -32,6 +32,8 @@ data/*_Backup/
 data/
 models/checkpoints/*
 models/*backup*/
+models/*swapped*/
+models/production/*swapped*/
 models/production/*.tmp
 !models/
 !models/production/
