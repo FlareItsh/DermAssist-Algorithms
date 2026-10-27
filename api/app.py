@@ -428,9 +428,9 @@ async def predict(file: UploadFile = File(...)):
         herpes_aff = semantic_affinity.get("herpes", 0.0)
 
         # 1. Disentangle Pustules vs Vesicles on Facial Acne:
-        # If classifier predicted Herpes, but semantic affinity strongly indicates follicular/cystic acne
+        # If classifier predicted Herpes with low confidence, but semantic affinity strongly indicates follicular/cystic acne
         # on cheek/jawline (acne_aff >= 0.65) while vesicular herpes affinity is low (< 0.15):
-        if raw_label == "Herpes" and acne_aff >= 0.65 and herpes_aff < 0.15:
+        if raw_label == "Herpes" and acne_aff >= 0.65 and herpes_aff < 0.15 and raw_conf < 0.60:
             print(f"[Anatomical Heuristic] Overriding Herpes -> Acne (acne_aff={acne_aff:.3f} > herpes_aff={herpes_aff:.3f})")
             transfer = all_probs.get("Herpes", 0.0) * 0.75
             all_probs["Acne"] = all_probs.get("Acne", 0.0) + transfer
@@ -442,10 +442,9 @@ async def predict(file: UploadFile = File(...)):
             raw_conf = all_probs[raw_label]
 
         # 2. Non-Vesicular Neck/Trunk Herpes Guard:
-        # Herpes requires clustered fluid vesicles. If Herpes was predicted on a diffuse non-vesicular rash
-        # where Herpes affinity is near zero (< 0.08): safely route to Inconclusive rather than misdiagnosing
-        elif raw_label == "Herpes" and herpes_aff < 0.08:
-            print(f"[Anatomical Heuristic] Non-vesicular rash detected; routing Herpes -> Inconclusive (herpes_aff={herpes_aff:.3f})")
+        # Only route if model is genuinely doubtful (raw_conf < 0.50). Never override high-confidence predictions!
+        elif raw_label == "Herpes" and herpes_aff < 0.08 and raw_conf < 0.50:
+            print(f"[Anatomical Heuristic] Non-vesicular rash with doubtful confidence ({raw_conf:.3f}); routing Herpes -> Inconclusive")
             raw_label = "Inconclusive"
 
         # Sort probability values descending
@@ -457,6 +456,8 @@ async def predict(file: UploadFile = File(...)):
 
         if is_inconclusive:
             final_label = "Inconclusive"
+            if raw_label == "Inconclusive":
+                raw_conf = min(raw_conf, 0.40)
             clinical_feedback = (
                 "This skin scan could not be matched with high certainty to our 3 priority conditions "
                 "(Acne, Eczema, Herpes). Please consult a licensed dermatologist for comprehensive evaluation."
