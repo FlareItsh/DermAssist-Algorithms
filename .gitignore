@@ -33,9 +33,11 @@ data/
 models/checkpoints/*
 models/*backup*/
 models/production/*.tmp
+models/production/*.pth
+*.pth
 !models/
 !models/production/
-!models/production/*.pth
+!models/production/.gitkeep
 !**/.gitkeep
 
 # --- Training Artifacts ---
