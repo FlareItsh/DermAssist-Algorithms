@@ -447,6 +447,21 @@ async def predict(file: UploadFile = File(...)):
             print(f"[Anatomical Heuristic] Non-vesicular rash with doubtful confidence ({raw_conf:.3f}); routing Herpes -> Inconclusive")
             raw_label = "Inconclusive"
 
+        # 3. Disentangle Hand/Extremity Dermatitis vs Facial/Truncal Acne:
+        # Acne vulgaris strictly requires pilosebaceous units (face, chest, back, shoulders).
+        # When a lesion has notable Eczema competition (all_probs["Eczema"] >= 0.20)
+        # and CLIP semantic affinity confirms dermatitis / eczema (eczema_aff >= 0.40):
+        elif raw_label == "Acne" and all_probs.get("Eczema", 0.0) >= 0.20 and eczema_aff >= 0.40:
+            print(f"[Anatomical Heuristic] Overriding Acne -> Eczema on dermatitis morphology (eczema_aff={eczema_aff:.3f} > acne_aff={acne_aff:.3f})")
+            transfer = all_probs.get("Acne", 0.0) * 0.75
+            all_probs["Eczema"] = all_probs.get("Eczema", 0.0) + transfer
+            all_probs["Acne"] = all_probs.get("Acne", 0.0) - transfer
+            prob_sum = sum(all_probs.values())
+            if prob_sum > 0:
+                all_probs = {k: round(v / prob_sum, 4) for k, v in all_probs.items()}
+            raw_label = max(all_probs, key=lambda k: all_probs[k])
+            raw_conf = all_probs[raw_label]
+
         # Sort probability values descending
         sorted_probs = sorted(all_probs.values(), reverse=True)
         top_margin = (sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else sorted_probs[0]
