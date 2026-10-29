@@ -226,6 +226,9 @@ class EnsemblePredictor:
             device: Target device ("cuda", "cpu", or "auto").
         """
         self.predictors = []
+        self.model_weights = []
+        configured_weights = config.get("inference", {}).get("ensemble_weights", {})
+
         for path, arch in model_paths_and_archs:
             if os.path.exists(path):
                 self.predictors.append(
@@ -236,6 +239,7 @@ class EnsemblePredictor:
                         architecture=arch,
                     )
                 )
+                self.model_weights.append(configured_weights.get(arch, 1.0))
             else:
                 print(f"[Ensemble] ⚠ WARNING: Model not found at {path}, skipping.")
         
@@ -245,7 +249,8 @@ class EnsemblePredictor:
         self.class_names = self.predictors[0].class_names
         self.architecture = f"ensemble ({', '.join([arch for _, arch in model_paths_and_archs])})"
         self.device = self.predictors[0].device
-        print(f"[Ensemble] ✓ Loaded {len(self.predictors)} models with TTA ({len(self._TTA_TRANSFORMS)} augmentations).")
+        arch_names = [arch for _, arch in model_paths_and_archs if os.path.exists(_)]
+        print(f"[Ensemble] ✓ Loaded {len(self.predictors)} models with TTA ({len(self._TTA_TRANSFORMS)} augmentations). Weights: {dict(zip(arch_names, self.model_weights))}")
 
     def _tta_predict(self, predictor: SkinLesionPredictor, image: Image.Image) -> dict:
         """
@@ -295,18 +300,22 @@ class EnsemblePredictor:
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Accumulate TTA-averaged probabilities across all models
+        # Accumulate TTA-averaged probabilities weighted across models
         avg_probs = {cls: 0.0 for cls in self.class_names}
+        total_weight = sum(self.model_weights) if self.model_weights else float(len(self.predictors))
+        if total_weight <= 0:
+            total_weight = float(len(self.predictors))
         
-        for predictor in self.predictors:
+        for predictor, weight in zip(self.predictors, self.model_weights):
             tta_result = self._tta_predict(predictor, image)
+            normalized_weight = weight / total_weight
             for cls in self.class_names:
-                avg_probs[cls] += tta_result[cls]
+                avg_probs[cls] += tta_result[cls] * normalized_weight
 
-        # Average across models
-        num_models = len(self.predictors)
-        for cls in self.class_names:
-            avg_probs[cls] = round(avg_probs[cls] / num_models, 4)
+        # Normalize and round across models
+        prob_sum = sum(avg_probs.values())
+        if prob_sum > 0:
+            avg_probs = {cls: round(v / prob_sum, 4) for cls, v in avg_probs.items()}
 
         # Find winner
         best_class = max(avg_probs, key=avg_probs.get)

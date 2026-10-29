@@ -35,9 +35,11 @@ models/*backup*/
 models/*swapped*/
 models/production/*swapped*/
 models/production/*.tmp
+models/production/*.pth
+*.pth
 !models/
 !models/production/
-!models/production/*.pth
+!models/production/.gitkeep
 !**/.gitkeep
 
 # --- Training Artifacts ---
