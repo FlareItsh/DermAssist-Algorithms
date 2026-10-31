@@ -173,6 +173,9 @@ class SkinValidator:
             "a close-up photo of clear healthy cheek and glowing smooth skin",
             "a portrait or photo of a person with clear healthy facial skin, beauty cosmetics, and smooth complexion",
             "a close-up photo of a clean healthy face, flawless smooth skin, and clear complexion",
+            "a selfie photo of a young person or man with clean clear smooth facial skin and forehead without pimples or acne",
+            "a close-up photo of a clear forehead, cheek, or temple with natural physiological pores, no redness, and no pimples",
+            "a photo of completely uninflamed healthy facial epidermis with normal skin tone and no active acne breakouts",
             # Macro Skin & Natural Texture
             "a clinical close-up macro photograph of completely normal healthy human skin, clear intact epidermis, and physiological skin texture",
             "a clinical dermatological photograph of normal healthy skin with intact epidermal barrier, physiological skin lines, and clear skin appearance",
@@ -183,6 +186,7 @@ class SkinValidator:
             "a close-up photo of an ankle, foot, heel, leg, arm, or hand with completely clear, healthy, unblemished, uninflamed skin without any rash or spots",
             "a close-up photo of clean healthy arm, wrist, or hand with flawless unblemished epidermis and no dermatological spots",
             "a close-up photo of jewelry, beads, or watch worn on healthy normal skin",
+            "a close-up photo of a benign beauty mark or small normal brown mole on healthy unblemished skin",
         ]
 
         # Tier D: Distant Full Body, Distant Poses & Aesthetic Procedures
@@ -343,8 +347,8 @@ class SkinValidator:
         # 1. Non-skin objects, memes, animals
         if non_skin_score >= 0.35 and non_skin_score > lesion_score and non_skin_score > unsupported_score:
             winning_category = "non_skin"
-        # 2. Healthy unblemished skin / clear face (requires healthy_score >= 0.55 and decisive margin over lesion_score)
-        elif healthy_score >= 0.55 and healthy_score > (lesion_score * 1.5) and healthy_score >= full_body_score and healthy_score > unsupported_score:
+        # 2. Healthy unblemished skin / clear face (clean skin decisively beats lesion and unsupported scores)
+        elif (healthy_score >= 0.35 and healthy_score > lesion_score and healthy_score > unsupported_score) or (healthy_score >= 0.30 and healthy_score > lesion_score * 1.2):
             winning_category = "healthy_skin"
         # 3. Distant full-body portraits, distant poses, clothing, and aesthetic procedures
         elif full_body_score >= 0.30 or (full_body_score >= 0.25 and full_body_score > lesion_score):
